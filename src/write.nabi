@@ -1,0 +1,381 @@
+//! `Writer`: records out, each field quoted only as the dialect's
+//! `QuoteStyle` says, to a stream or to memory.
+
+use pkg::{CsvError, Dialect, ErrorKind, QuoteStyle, Record, ToRecord};
+use core::collections::Slice;
+use core::io::IoError;
+
+/// Bytes kept before a stream writer passes them on.
+const FLUSH_AT: usize = 1 << 16;
+
+/// Writes records.
+///
+/// ```nabi
+/// let w = csv::Dialect::new().to_buffer();
+/// try! w.write_record(["name", "note"]);
+/// try! w.write_record(["Ann", "says \"hi\", twice"]);
+/// assert(w.as_str() == "name,note\nAnn,\"says \"\"hi\"\", twice\"\n");
+/// ```
+pub struct Writer {
+    // Each part is a list (or a buffer), so a call copies only four
+    // references, and a scalar is stored without rewriting a struct.
+    st: List<State>;
+    out: StrBuf;
+    /// The record state, then the dialect's bytes (256: none) and switches.
+    at: List<usize>;
+    /// 1 for each byte that makes a field need quotes.
+    cls: List<u8>;
+}
+
+/// What a write changes rarely.
+struct State {
+    sink: fn(Slice<u8>) throws (IoError);
+    /// `serialize`'s fields.
+    row: List<str>;
+    line_end: str;
+}
+
+// Slots of `Writer::at`.
+const FIELDS: usize = 0;
+const WIDTH: usize = 1;
+/// Where the current record starts in `out`.
+const REC_START: usize = 2;
+const HEADER_DONE: usize = 3;
+const LINE: usize = 4;
+/// An empty field alone may stay a blank line (`write_unquoted`).
+const BLANK: usize = 5;
+const STYLE: usize = 6;
+const DELIM: usize = 7;
+const QUOTE: usize = 8;
+const ESCAPE: usize = 9;
+const COMMENT: usize = 10;
+const BITS: usize = 11;
+/// `line_end`'s bytes, when it is `\n` (10) or `\r\n` (0); else 1.
+const EOL: usize = 12;
+
+// Bits of `Writer::bits`.
+const DOUBLE: u32 = 1u32;
+const STREAM: u32 = 2u32;
+const FLEXIBLE: u32 = 4u32;
+const HEADER: u32 = 16u32;
+
+// `at[STYLE]`.
+const NECESSARY: usize = 0;
+const ALWAYS: usize = 1;
+const NON_NUMERIC: usize = 2;
+const NEVER: usize = 3;
+
+const NO_WIDTH: usize = usize::MAX;
+
+impl Writer {
+    pub(pkg) fn stream(d: Dialect, sink: fn(Slice<u8>) throws (IoError)) -> Writer {
+        Writer::new(d, sink, true)
+    }
+
+    pub(pkg) fn memory(d: Dialect) -> Writer { Writer::new(d, |_| {}, false) }
+
+    fn new(d: Dialect, sink: fn(Slice<u8>) throws (IoError), stream: bool) -> Writer {
+        let style = match d.quote_style {
+            QuoteStyle::Necessary => NECESSARY,
+            QuoteStyle::Always => ALWAYS,
+            QuoteStyle::NonNumeric => NON_NUMERIC,
+            QuoteStyle::Never => NEVER,
+        };
+        let bits = (if d.double_quote { DOUBLE } else { 0u32 }) | (if stream { STREAM } else { 0u32 })
+            | (if d.flexible { FLEXIBLE } else { 0u32 }) | (if d.header { HEADER } else { 0u32 });
+        let cls = List::filled(256, 0u8);
+        cls[d.delim as usize] = 1u8;
+        cls[0x0A] = 1u8;
+        cls[0x0D] = 1u8;
+        if let c: u8 = d.quote { cls[c as usize] = 1u8; }
+        if let c: u8 = d.escape { cls[c as usize] = 1u8; }
+        let out = if stream { StrBuf::with_capacity(FLUSH_AT + 4096) } else { StrBuf::new() };
+        if d.bom { out.push('\u{FEFF}'); }
+        let eol = if d.line_end == "\n" { 10 } else if d.line_end == "\r\n" { 0 } else { 1 };
+        Writer {
+            st: [State { sink, row: List::new(), line_end: d.line_end }],
+            out,
+            at: [0, NO_WIDTH, out.len(), 0, 1, 0, style, d.delim as usize, byte(d.quote) as usize, byte(d.escape) as usize, byte(d.comment) as usize, bits as usize, eol],
+            cls,
+        }
+    }
+
+    /// One field of the current record.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.write_field("a");
+    /// try! w.write_field("b c");
+    /// try! w.end_record();
+    /// assert(w.as_str() == "a,b c\n");
+    /// ```
+    #[inline(always)]
+    pub fn write_field(self, s: str) throws (CsvError) {
+        let at = self.at;
+        let f = at[FIELDS];
+        let out = self.out;
+        if f > 0 { unsafe { out.push_byte(at[DELIM] as u8); } }
+        // Most fields need no quotes: copy them straight.
+        if at[STYLE] == NECESSARY && needs(s, f, self.cls, self.at[COMMENT] as u32) == 0u8 {
+            out.push_str(s);
+        } else {
+            try self.put(s, f);
+        }
+        at[FIELDS] = f + 1;
+    }
+
+    /// One field, quoted whatever the style (so a field that reads as
+    /// a null marker, such as `NA`, stays a value).
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.write_quoted("NA");
+    /// try! w.write_field("NA");
+    /// try! w.end_record();
+    /// assert(w.as_str() == "\"NA\",NA\n");
+    /// ```
+    pub fn write_quoted(self, s: str) throws (CsvError) {
+        let style = self.at[STYLE];
+        self.at[STYLE] = ALWAYS;
+        try self.write_field(s) catch e {
+            self.at[STYLE] = style;
+            throw e;
+        };
+        self.at[STYLE] = style;
+    }
+
+    /// One field as it is, never quoted; a field that needs quotes is
+    /// an error. An empty one alone makes a blank line.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.write_unquoted("");
+    /// try! w.end_record();
+    /// assert(w.as_str() == "\n");
+    /// ```
+    pub fn write_unquoted(self, s: str) throws (CsvError) {
+        let style = self.at[STYLE];
+        self.at[STYLE] = NEVER;
+        try self.write_field(s) catch e {
+            self.at[STYLE] = style;
+            throw e;
+        };
+        self.at[STYLE] = style;
+        self.at[BLANK] = 1;
+    }
+
+    /// One field exactly as given, with no quoting and no check: for
+    /// text known to need no quotes, such as a number, at the speed of a
+    /// copy. Text that needs quotes makes output that reads back wrong.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.write_raw("42");
+    /// try! w.write_raw("2.5");
+    /// try! w.end_record();
+    /// assert(w.as_str() == "42,2.5\n");
+    /// ```
+    #[inline]
+    pub fn write_raw(self, s: str) throws (CsvError) {
+        let at = self.at;
+        let f = at[FIELDS];
+        let out = self.out;
+        if f > 0 { unsafe { out.push_byte(at[DELIM] as u8); } }
+        out.push_str(s);
+        if f == 0 { at[BLANK] = 1; }
+        at[FIELDS] = f + 1;
+    }
+
+    /// End the current record.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().crlf(true).to_buffer();
+    /// try! w.write_field("x");
+    /// try! w.end_record();
+    /// assert(w.as_str() == "x\r\n");
+    /// ```
+    #[inline]
+    pub fn end_record(self) throws (CsvError) {
+        let at = self.at;
+        let n = at[FIELDS];
+        at[FIELDS] = 0;
+        if (self.at[BITS] as u32) & FLEXIBLE == 0u32 {
+            let w = at[WIDTH];
+            if w == NO_WIDTH {
+                at[WIDTH] = n;
+            } else if n != w {
+                throw CsvError::new(ErrorKind::FieldCount, f"record {at[LINE]} has {n} fields, but the first had {w}; write {w} fields per record, or use `Dialect::flexible(true)`");
+            }
+        }
+        // A lone empty field would read back as a blank line.
+        let out = self.out;
+        if n == 1 && at[BLANK] == 0 && out.len() == at[REC_START] && (self.at[QUOTE] as u32) < 256 {
+            out.push((self.at[QUOTE] as u32) as u8 as char);
+            out.push((self.at[QUOTE] as u32) as u8 as char);
+        }
+        let e = at[EOL];
+        if e == 10 {
+            unsafe { out.push_byte(0x0Au8); }
+        } else if e == 0 {
+            unsafe {
+                out.push_byte(0x0Du8);
+                out.push_byte(0x0Au8);
+            }
+        } else {
+            out.push_str(self.st[0].line_end);
+        }
+        at[LINE] += 1;
+        at[BLANK] = 0;
+        if (self.at[BITS] as u32) & STREAM != 0u32 && out.len() >= FLUSH_AT { try self.drain(); }
+        at[REC_START] = out.len();
+    }
+
+    /// A whole record.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::tsv().to_buffer();
+    /// try! w.write_record(["a", "b"]);
+    /// assert(w.as_str() == "a\tb\n");
+    /// ```
+    pub fn write_record(self, fields: List<str>) throws (CsvError) {
+        for f in fields { try self.write_field(f); }
+        try self.end_record();
+    }
+
+    /// A record read by a `Reader`.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.write(csv::Record::from_list(["1", "x,y"]));
+    /// assert(w.as_str() == "1,\"x,y\"\n");
+    /// ```
+    pub fn write(self, r: Record) throws (CsvError) {
+        for i in 0..r.len() { try self.write_field(r.field(i)); }
+        try self.end_record();
+    }
+
+    /// A row of a `#[derive(Csv)]` type; the first call writes the
+    /// header first when the dialect has one.
+    ///
+    /// ```nabi
+    /// #[derive(csv::Csv)]
+    /// struct P { x: i32; tag: str | none; }
+    ///
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.serialize(P { x: 1, tag: "a" });
+    /// try! w.serialize(P { x: 2, tag: none });
+    /// assert(w.as_str() == "x,tag\n1,a\n2,\n");
+    /// ```
+    pub fn serialize<T: ToRecord>(self, x: T) throws (CsvError) {
+        if self.at[HEADER_DONE] == 0 {
+            self.at[HEADER_DONE] = 1;
+            if (self.at[BITS] as u32) & HEADER != 0u32 { try self.write_record(T::header()); }
+        }
+        let row = self.st[0].row;
+        row.clear();
+        x.to_record(row);
+        for f in row { try self.write_field(f); }
+        try self.end_record();
+    }
+
+    /// Pass what is buffered to the stream and flush it.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.flush();
+    /// ```
+    pub fn flush(self) throws (CsvError) {
+        if (self.at[BITS] as u32) & STREAM != 0u32 { try self.drain(); }
+    }
+
+    /// The text written so far (a memory writer's output).
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.write_record(["a"]);
+    /// assert(w.as_str() == "a\n");
+    /// ```
+    pub fn as_str(self) -> str { self.out.to_str() }
+
+    fn drain(self) throws (CsvError) {
+        if self.out.is_empty() { return; }
+        let s = self.out.to_str();
+        self.out.clear();
+        let sink = self.st[0].sink;
+        try sink(s.as_bytes()) catch e { throw CsvError::io(e); };
+    }
+
+    /// `s`, quoted as the style says; `f` fields came before it.
+    #[cold]
+    fn put(self, s: str, f: usize) throws (CsvError) {
+        let style = self.at[STYLE];
+        let need = if style == ALWAYS {
+            true
+        } else {
+            let k = needs(s, f, self.cls, self.at[COMMENT] as u32);
+            if style == NEVER && k == 2u8 {
+                throw CsvError::new(ErrorKind::Write, f"field {s:?} needs quotes (it holds the delimiter, a quote or a line break); use `QuoteStyle::Necessary`, or take those out of the field");
+            }
+            if style == NEVER { false } else if style == NON_NUMERIC { k > 0u8 || !is_number(s) } else { k > 0u8 }
+        };
+        let out = self.out;
+        if !need {
+            out.push_str(s);
+            return;
+        }
+        if (self.at[QUOTE] as u32) >= 256 {
+            throw CsvError::new(ErrorKind::Write, f"field {s:?} needs quotes, but the dialect has none; set one with `Dialect::quote('\"')`");
+        }
+        let q = (self.at[QUOTE] as u32) as u8;
+        let qc = q as char;
+        out.push(qc);
+        let esc = (self.at[ESCAPE] as u32);
+        let double = (self.at[BITS] as u32) & DOUBLE != 0u32 || esc >= 256;
+        let seg: usize = 0;
+        let b = s.as_bytes();
+        for i in 0..b.len() {
+            let c = b[i];
+            if c == q {
+                out.push_str(s[seg:i]);
+                out.push(if double { qc } else { esc as u8 as char });
+                seg = i;
+            } else if c as u32 == esc {
+                out.push_str(s[seg:i]);
+                out.push(c as char);
+                seg = i;
+            }
+        }
+        out.push_str(s[seg:]);
+        out.push(qc);
+    }
+}
+
+/// Whether `s` must be quoted to read back as itself: 2 when it
+/// holds the delimiter, a quote, the escape or a line break; 1 when
+/// only a comment or a trimming reader would change it; else 0.
+#[inline(always)]
+fn needs(s: str, f: usize, cls: List<u8>, cm: u32) -> u8 {
+    let n = s.len();
+    if n == 0 { return 0u8; }
+    let b = s.as_bytes();
+    // No early exit: an OR over a short field is cheaper than a branch a byte.
+    let k = 0u8;
+    for i in 0..n { k |= cls[b[i] as usize]; }
+    if k != 0u8 { return 2u8; }
+    if f == 0 && b[0] as u32 == cm { return 1u8; }
+    // A reader that trims would drop outer blanks.
+    let first = b[0];
+    let last = b[n - 1];
+    if first == 0x20u8 || first == 0x09u8 || last == 0x20u8 || last == 0x09u8 { 1u8 } else { 0u8 }
+}
+
+/// `c` as a field of `Writer`: 256 for none.
+fn byte(c: u8 | none) -> u32 {
+    match c {
+        x: u8 => x as u32,
+        none => 256,
+    }
+}
+
+/// Whether `s` reads as a number (for `QuoteStyle::NonNumeric`).
+fn is_number(s: str) -> bool { !s.is_empty() && !((try? s.parse::<f64>()) is none) }

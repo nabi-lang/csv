@@ -1,0 +1,72 @@
+//! Tests: the RFC 4180 examples, dialects, malformed input, streaming
+//! in every chunk size, typed rows, the writer, and a large random
+//! round trip.
+
+mod dialect;
+mod malformed;
+mod rfc;
+mod roundtrip;
+mod stream;
+mod typed;
+mod write;
+
+use pkg::{CsvError, Dialect, Record};
+use core::collections::SliceMut;
+use core::io::IoError;
+
+/// Every record of `s` read with `d`, as lists.
+pub fn rows(d: Dialect, s: str) -> List<List<str>> {
+    let r = d.from_str(s);
+    let out: List<List<str>> = List::new();
+    loop {
+        let rec = try r.next() catch e { panic(f"{e}"); };
+        match rec {
+            x: Record => out.push(x.to_list()),
+            none => break,
+        }
+    }
+    out
+}
+
+/// The records of `s` without a header.
+pub fn plain(s: str) -> List<List<str>> { rows(Dialect::new().has_header(false), s) }
+
+/// The error reading all of `s` with `d`.
+pub fn error(d: Dialect, s: str) -> CsvError {
+    let r = d.from_str(s);
+    let n = try r.count() catch e { return e; };
+    panic(f"no error, {n} records");
+}
+
+/// A reader handing out `step` bytes at a time.
+pub struct Chunks {
+    pub data: List<u8>;
+    pub at: usize;
+    pub step: usize;
+}
+
+impl Read for Chunks {
+    fn read(ref self, buf: SliceMut<u8>) throws (IoError) -> usize {
+        let n = 0usize;
+        while n < self.step && n < buf.len() && self.at < self.data.len() {
+            buf[n] = self.data[self.at];
+            n += 1;
+            self.at += 1;
+        }
+        n
+    }
+}
+
+/// Every record of `s` read with `d` from a stream of `step`-byte reads.
+pub fn streamed(d: Dialect, s: str, step: usize) -> List<List<str>> {
+    let r = d.reader(Chunks { data: s.as_bytes().to_list(), at: 0, step });
+    let out: List<List<str>> = List::new();
+    loop {
+        let rec = try r.next() catch e { panic(f"step {step}: {e}"); };
+        match rec {
+            x: Record => out.push(x.to_list()),
+            none => break,
+        }
+    }
+    out
+}

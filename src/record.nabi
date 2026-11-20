@@ -1,0 +1,358 @@
+//! `Record`: one row's fields as views of the text it was read from,
+//! and `Headers`, the header's names with a lookup by name.
+
+use core::index::Index;
+
+/// Field flags, kept above `SHIFT` in the field's end offset.
+pub(pkg) const QUOTED: usize = 1;
+pub(pkg) const ESC: usize = 2;
+pub(pkg) const SHIFT: usize = usize::BITS as usize - 2;
+/// The largest text offset: 1 GiB less one where `usize` is 32 bits.
+pub(pkg) const OFFSET: usize = (1 << SHIFT) - 1;
+/// Slots of a record in `Record::b` before its fields.
+pub(pkg) const HEAD: usize = 5;
+
+/// One record. A field is a view of the text the reader holds, not a
+/// copy; only a quoted field with an escaped quote (`""`) is rebuilt,
+/// when it is asked for.
+///
+/// ```nabi
+/// let r = csv::Dialect::new().from_str("name,qty\n\"Smith, J\",3\n");
+/// let rec = try! r.next() ?? csv::Record::new();
+/// assert(rec.len() == 2 && rec[0] == "Smith, J" && rec.is_quoted(0));
+/// assert(rec.get(5) is none);
+/// assert(rec.line() == 2);
+/// ```
+pub struct Record {
+    pub(pkg) text: str;
+    /// From `at`: the field count, the line, the quote and escape bytes
+    /// (`q | e << 16`, 256: none), the byte position's low and high 32
+    /// bits, then the start
+    /// and end of each field in `text`, the end with the flags above
+    /// `SHIFT`.
+    pub(pkg) b: List<usize>;
+    pub(pkg) at: usize;
+}
+
+impl Record {
+    /// An empty record, to read into with `Reader::read`.
+    ///
+    /// ```nabi
+    /// assert(csv::Record::new().is_empty());
+    /// ```
+    pub fn new() -> Record {
+        Record { text: "", b: [0, 0, 256 | (256 << 16), 0, 0], at: 0 }
+    }
+
+    /// A record holding `fields`, for writing or tests.
+    ///
+    /// ```nabi
+    /// let rec = csv::Record::from_list(["a", "b,c"]);
+    /// assert(rec.len() == 2 && rec[1] == "b,c");
+    /// ```
+    pub fn from_list(fields: List<str>) -> Record {
+        let r = Record::new();
+        let sb = StrBuf::new();
+        for f in fields {
+            let a = sb.len();
+            sb.push_str(f);
+            r.b.push(a);
+            r.b.push(sb.len());
+        }
+        r.b[0] = fields.len();
+        r.text = sb.to_str();
+        r
+    }
+
+    /// The number of fields.
+    ///
+    /// ```nabi
+    /// assert(csv::Record::from_list(["x", "y"]).len() == 2);
+    /// ```
+    #[inline]
+    pub fn len(self) -> usize { self.b[self.at] }
+
+    /// Whether there are no fields.
+    ///
+    /// ```nabi
+    /// assert(!csv::Record::from_list([""]).is_empty());
+    /// ```
+    #[inline]
+    pub fn is_empty(self) -> bool { self.b[self.at] == 0 }
+
+    /// Field `i`, or `none` past the last.
+    ///
+    /// ```nabi
+    /// let rec = csv::Record::from_list(["x"]);
+    /// assert(rec.get(0) == "x" && rec.get(1) is none);
+    /// ```
+    #[inline]
+    pub fn get(self, i: usize) -> str | none {
+        if i >= self.len() { return none; }
+        self.field(i)
+    }
+
+    /// Whether field `i` was quoted in the input. A quoted empty field
+    /// (`""`) is a value where an unquoted one may stand for a missing
+    /// one.
+    ///
+    /// ```nabi
+    /// let rec = try! csv::Dialect::new().has_header(false).from_str("\"\",\n").next() ?? csv::Record::new();
+    /// assert(rec.is_quoted(0) && !rec.is_quoted(1));
+    /// ```
+    #[inline]
+    pub fn is_quoted(self, i: usize) -> bool { i < self.len() && (self.b[self.at + HEAD + 2 * i + 1] >> SHIFT) & QUOTED != 0 }
+
+    /// The line the record starts on, 1-based (0 for a record not read).
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().from_str("a\n\"x\ny\"\nz\n");
+    /// _ = try! r.next();
+    /// assert((try! r.next() ?? csv::Record::new()).line() == 4);
+    /// ```
+    #[inline]
+    pub fn line(self) -> usize { self.b[self.at + 1] }
+
+    /// The byte offset of the record in the input.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().from_str("a\n12\n");
+    /// assert((try! r.next() ?? csv::Record::new()).position() == 2);
+    /// ```
+    pub fn position(self) -> u64 { self.b[self.at + 3] as u64 | ((self.b[self.at + 4] as u64) << 32) }
+
+    /// The field named `name` in `h`, or `none`.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().from_str("id,name\n7,ann\n");
+    /// let h = try! r.headers();
+    /// let rec = try! r.next() ?? csv::Record::new();
+    /// assert(rec.by_name(h, "name") == "ann" && rec.by_name(h, "age") is none);
+    /// ```
+    pub fn by_name(self, h: Headers, name: str) -> str | none {
+        match h.index(name) {
+            i: usize => self.get(i),
+            none => none,
+        }
+    }
+
+    /// The fields in order.
+    ///
+    /// ```nabi
+    /// let rec = csv::Record::from_list(["a", "b"]);
+    /// assert(rec.iter().collect::<List<str>>() == ["a", "b"]);
+    /// ```
+    pub fn iter(self) -> Fields { Fields { r: self, i: 0 } }
+
+    /// The fields as a list.
+    ///
+    /// ```nabi
+    /// assert(csv::Record::from_list(["a", "b"]).to_list() == ["a", "b"]);
+    /// ```
+    pub fn to_list(self) -> List<str> {
+        let n = self.len();
+        let out: List<str> = List::with_capacity(n);
+        for i in 0..n { out.push(self.field(i)); }
+        out
+    }
+
+    /// Remove every field, keeping the room.
+    ///
+    /// ```nabi
+    /// let rec = csv::Record::from_list(["a"]);
+    /// rec.clear();
+    /// assert(rec.is_empty());
+    /// ```
+    pub fn clear(ref self) {
+        self.text = "";
+        self.b = [0, 0, 256 | (256 << 16), 0, 0];
+        self.at = 0;
+    }
+
+    /// Field `i`, which exists.
+    #[inline(always)]
+    pub(pkg) fn field(self, i: usize) -> str {
+        let b = self.b;
+        let f = self.at + HEAD + 2 * i;
+        let a = b[f];
+        let z = b[f + 1];
+        let s = self.text[a:z & OFFSET];
+        if (z >> SHIFT) & ESC == 0 { s } else { unescape(s, (b[self.at + 2] & 0xFFFF) as u32, (b[self.at + 2] >> 16) as u32) }
+    }
+
+    /// Whether field `i` is empty in the input.
+    pub(pkg) fn blank(self, i: usize) -> bool {
+        let b = self.b;
+        let f = self.at + HEAD + 2 * i;
+        b[f] == b[f + 1] & OFFSET
+    }
+
+    /// The character column of byte `at` of the text, 1-based, given
+    /// that the record starts at a line start.
+    pub(pkg) fn column_of(self, i: usize) -> usize {
+        let a = self.b[self.at + HEAD + 2 * i];
+        let s = self.text;
+        let ls = a;
+        while ls > 0 && s.byte(ls - 1) != 0x0Au8 && s.byte(ls - 1) != 0x0Du8 { ls -= 1; }
+        s[ls:a].chars().count() + 1
+    }
+
+    /// The line of field `i` (a quoted line break above it moves it).
+    pub(pkg) fn line_of(self, i: usize) -> usize {
+        let a = self.b[self.at + HEAD + 2 * i];
+        let s = self.text;
+        let n = self.line();
+        let j = self.b[self.at + HEAD];
+        while j < a {
+            let c = s.byte(j);
+            if c == 0x0Au8 || (c == 0x0Du8 && !(j + 1 < a && s.byte(j + 1) == 0x0Au8)) { n += 1; }
+            j += 1;
+        }
+        n
+    }
+}
+
+/// `s` with each doubled quote made one and each escape dropped.
+pub(pkg) fn unescape(s: str, q: u32, e: u32) -> str {
+    let out = StrBuf::with_capacity(s.len());
+    let n = s.len();
+    let seg: usize = 0;
+    let i: usize = 0;
+    while i < n {
+        let c = s.byte(i) as u32;
+        if c == e && i + 1 < n {
+            out.push_str(s[seg:i]);
+            seg = i + 1;
+            i += 2;
+        } else if c == q && i + 1 < n && s.byte(i + 1) as u32 == q {
+            out.push_str(s[seg:i + 1]);
+            seg = i + 2;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(s[seg:n]);
+    out.to_str()
+}
+
+impl Index<usize> for Record {
+    type Output = str;
+
+    /// Field `i`; panics past the last.
+    #[track_caller]
+    #[inline]
+    fn index(self, i: usize) -> str {
+        if i >= self.len() { panic(f"field {i} of a record with {self.len()} fields; use `get` when it may be missing"); }
+        self.field(i)
+    }
+}
+
+impl Clone for Record {
+    /// A record of its own, not sharing the reader's batch.
+    fn clone(self) -> Record {
+        let n = self.len();
+        let w = HEAD + 2 * n;
+        let b: List<usize> = List::with_capacity(w);
+        for k in 0..w { b.push(self.b[self.at + k]); }
+        Record { text: self.text, b, at: 0 }
+    }
+}
+
+impl PartialEq for Record {
+    fn eq(self, other: Record) -> bool { self.to_list() == other.to_list() }
+}
+
+impl Display for Record {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.to_list().join(",")) }
+}
+
+impl Debug for Record {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"Record({self.to_list():?})") }
+}
+
+/// The fields of a `Record`, in order.
+///
+/// ```nabi
+/// let n = 0;
+/// for f in csv::Record::from_list(["a", "b"]).iter() { n += f.len(); }
+/// assert(n == 2);
+/// ```
+pub struct Fields {
+    r: Record;
+    i: usize;
+}
+
+impl Iterator for Fields {
+    type Item = str;
+
+    fn next(ref self) -> str | none {
+        if self.i >= self.r.len() { return none; }
+        self.i += 1;
+        self.r.field(self.i - 1)
+    }
+}
+
+/// The header's names, with a lookup by name.
+///
+/// ```nabi
+/// let r = csv::Dialect::new().from_str("id,name,id\n");
+/// let h = try! r.headers();
+/// assert(h.len() == 3 && h.index("name") == 1usize);
+/// assert(h.index("id") == 0usize && h.index("x") is none);
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub struct Headers {
+    names: List<str>;
+    at: Dict<str, usize>;
+}
+
+impl Headers {
+    /// Headers with these names.
+    ///
+    /// ```nabi
+    /// assert(csv::Headers::new(["a", "b"]).names() == ["a", "b"]);
+    /// ```
+    pub fn new(names: List<str>) -> Headers {
+        let at: Dict<str, usize> = Dict::new();
+        for k in 0..names.len() {
+            if !at.contains_key(names[k]) { _ = at.insert(names[k], k); }
+        }
+        Headers { names, at }
+    }
+
+    /// The names, in order.
+    ///
+    /// ```nabi
+    /// assert(csv::Headers::new(["x"]).names() == ["x"]);
+    /// ```
+    pub fn names(self) -> List<str> { self.names }
+
+    /// The number of names.
+    ///
+    /// ```nabi
+    /// assert(csv::Headers::new(["x", "y"]).len() == 2);
+    /// ```
+    pub fn len(self) -> usize { self.names.len() }
+
+    /// Whether there are none (no header was read).
+    ///
+    /// ```nabi
+    /// assert(csv::Headers::new([]).is_empty());
+    /// ```
+    pub fn is_empty(self) -> bool { self.names.is_empty() }
+
+    /// The position of the first name `name`, or `none`.
+    ///
+    /// ```nabi
+    /// assert(csv::Headers::new(["a", "b"]).index("b") == 1usize);
+    /// ```
+    pub fn index(self, name: str) -> usize | none { self.at.get(name) }
+
+    /// Name `i`, or `none`.
+    ///
+    /// ```nabi
+    /// assert(csv::Headers::new(["a"]).get(0) == "a");
+    /// ```
+    pub fn get(self, i: usize) -> str | none { self.names.get(i) }
+}

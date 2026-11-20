@@ -1,0 +1,83 @@
+// Delimiters, quotes, escapes, comments, trimming, flexible rows, blank
+// lines.
+
+use pkg::tests::suite::{error, rows};
+use pkg::{Dialect, Trim};
+
+fn d() -> Dialect { Dialect::new().has_header(false) }
+
+#[test]
+fn delimiters() {
+    assert(rows(d().delimiter(';'), "a;b,c\n") == [["a", "b,c"]]);
+    assert(rows(Dialect::tsv().has_header(false), "a\tb c\t\"d\te\"\n") == [["a", "b c", "d\te"]]);
+    assert(rows(d().delimiter('|'), "1|2||3\n") == [["1", "2", "", "3"]]);
+}
+
+#[test]
+fn quote_choice() {
+    assert(rows(d().quote('\''), "'a,b','it''s'\n") == [["a,b", "it's"]]);
+    assert(rows(d().no_quotes(), "\"a\",b\n") == [["\"a\"", "b"]]);
+    // A quote in the middle of an unquoted field is text.
+    assert(rows(d(), "ab\"c,d\n") == [["ab\"c", "d"]]);
+}
+
+#[test]
+fn escapes() {
+    let e = d().escape('\\').double_quotes(false);
+    assert(rows(e, "\"a\\\"b\",\"c\\\\d\",\"x\\,y\"\n") == [["a\"b", "c\\d", "x,y"]]);
+    // Both forms at once.
+    let both = d().escape('\\');
+    assert(rows(both, "\"a\"\"b\\\"c\"\n") == [["a\"b\"c"]]);
+    // An escaped line break inside quotes.
+    assert(rows(e, "\"a\\\nb\",c\n") == [["a\nb", "c"]]);
+}
+
+#[test]
+fn comments() {
+    let c = d().comment('#');
+    assert(rows(c, "# head\na,b\n#x,y\n  #not,a comment\nc,d\n# tail") == [["a", "b"], ["  #not", "a comment"], ["c", "d"]]);
+    assert(rows(c, "#only\n") == List::<List<str>>::new());
+    // A quoted field starting with the comment byte is data.
+    assert(rows(c, "\"#a\",b\n") == [["#a", "b"]]);
+}
+
+#[test]
+fn trimming() {
+    assert(rows(d().trim(Trim::All), "  a  ,\tb\t,  \" c \"  ,\n") == [["a", "b", " c ", ""]]);
+    assert(rows(d().trim(Trim::Fields), " x , y \n") == [["x", "y"]]);
+    let h = Dialect::new().trim(Trim::Headers).from_str(" id , name \n 1 , a \n");
+    assert((try! h.headers()).names() == ["id", "name"]);
+    assert((try! h.next() ?? pkg::Record::new()).to_list() == [" 1 ", " a "]);
+    let t = d().trim(Trim::All);
+    let msg = error(t, "\"a\" x,b\n").message();
+    assert(msg.contains("after a closing quote"), msg);
+}
+
+#[test]
+fn flexible_rows() {
+    let f = d().flexible(true);
+    assert(rows(f, "a,b\nc\nd,e,f\n") == [["a", "b"], ["c"], ["d", "e", "f"]]);
+    let e = error(d(), "a,b\nc\n");
+    assert(e.kind == pkg::ErrorKind::FieldCount && e.line == 2, e.message());
+    assert(e.message().contains("has 1 fields, but the first record has 2"), e.message());
+    let h = error(Dialect::new(), "a,b\n1,2,3\n");
+    assert(h.message().contains("the header has 2"), h.message());
+}
+
+#[test]
+fn blank_lines() {
+    let k = d().skip_blank_lines(false);
+    assert(rows(k, "a\n\nb\n") == [["a"], [""], ["b"]]);
+    assert(rows(k, "a\r\n\r\nb\r\n") == [["a"], [""], ["b"]]);
+}
+
+// A panic under wasm exits 1, which `should_panic` does not take.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+#[should_panic]
+fn delimiter_must_be_ascii() { _ = Dialect::new().delimiter('é'); }
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+#[should_panic]
+fn delimiter_not_a_line_break() { _ = Dialect::new().delimiter('\n'); }

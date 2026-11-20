@@ -1,0 +1,89 @@
+// Typed rows: `#[derive(Csv)]`, columns by name, optional fields,
+// defaults, and decode errors that name the field.
+
+use pkg::{CsvError, Dialect, ErrorKind, FromField, ToField};
+
+#[derive(Csv, Clone, PartialEq, Debug)]
+struct Trade {
+    sym: str;
+    qty: i64;
+    px: f64;
+    side: char;
+    live: bool;
+    note: str | none;
+    venue: str = "XNYS";
+}
+
+fn trades(s: str) -> List<Trade> {
+    try pkg::from_str(s).decode::<Trade>().collect::<List<Trade>>() catch e { panic(f"{e}"); }
+}
+
+fn decode_error(s: str) -> CsvError {
+    let n = try pkg::from_str(s).decode::<Trade>().collect::<List<Trade>>().len() catch e { return e; };
+    panic(f"no error, {n} rows");
+}
+
+#[test]
+fn by_name() {
+    let t = trades("px,qty,sym,side,live,extra\n10.5,100,ABC,B,true,x\n-1e2,-3,\"X,Y\",S,FALSE,y\n");
+    assert(t.len() == 2);
+    assert(t[0] == Trade { sym: "ABC", qty: 100, px: 10.5, side: 'B', live: true, note: none, venue: "XNYS" });
+    assert(t[1].sym == "X,Y" && t[1].px == -100.0 && !t[1].live);
+}
+
+#[test]
+fn optional_and_default() {
+    let t = trades("sym,qty,px,side,live,note,venue\nA,1,1,B,true,,\nB,2,2,S,false,hi,XLON\n");
+    assert(t[0].note is none && t[0].venue == "XNYS");
+    assert(t[1].note == "hi" && t[1].venue == "XLON");
+}
+
+#[test]
+fn errors_name_the_field() {
+    let e = decode_error("sym,qty,px,side,live\nA,1,1,B,true\nB,x2,2,S,false\n");
+    assert(e.kind == ErrorKind::Decode && e.line == 3 && e.column == 3 && e.field == "qty", e.message());
+    assert(e.message() == "line 3, column 3, field `qty`: `x2` is not a whole number that fits in i64; write one such as `42`", e.message());
+    let m = decode_error("sym,qty,px,side\nA,1,1,B\n");
+    assert(m.field == "live" && m.message().contains("no such column"), m.message());
+    let b = decode_error("sym,qty,px,side,live\nA,1,1,B,yes\n");
+    assert(b.message().contains("write `true` or `false`"), b.message());
+    let c = decode_error("sym,qty,px,side,live\nA,1,1,BB,true\n");
+    assert(c.message().contains("one character"), c.message());
+    let empty = decode_error("sym,qty,px,side,live\nA,,1,B,true\n");
+    assert(empty.message().contains("make the field `i64 | none`"), empty.message());
+    let range: u8 = try FromField::from_field("300") catch _ { 0u8 };
+    assert(range == 0u8);
+}
+
+#[derive(Csv, PartialEq, Debug)]
+struct Pair {
+    a: i32;
+    b: f32 | none;
+}
+
+#[test]
+fn without_header() {
+    let r = Dialect::new().has_header(false).from_str("1,2.5\n3,\n");
+    let ps = try! r.decode::<Pair>().collect::<List<Pair>>();
+    assert(ps == [Pair { a: 1, b: 2.5f32 }, Pair { a: 3, b: none }]);
+}
+
+#[test]
+fn round_trip() {
+    let t = [
+        Trade { sym: "a,b", qty: -5, px: 0.1, side: '"', live: true, note: "two\nlines", venue: "V" },
+        Trade { sym: "", qty: 0, px: 1e300, side: 'x', live: false, note: none, venue: "" },
+    ];
+    let s = try! pkg::to_str(t);
+    let back = trades(s);
+    assert(back[0] == t[0], f"{back[0]:?}");
+    assert(back[1].sym == "" && back[1].px == 1e300 && back[1].note is none && back[1].venue == "XNYS");
+}
+
+#[test]
+fn field_conversions() {
+    assert(try! u64::from_field("18446744073709551615") == u64::MAX);
+    assert(try! f32::from_field("1.5") == 1.5f32);
+    assert((try! f64::from_field("nan")).is_nan());
+    assert(true.to_field() == "true" && 'q'.to_field() == "q" && (-3i8).to_field() == "-3");
+}

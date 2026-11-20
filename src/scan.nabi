@@ -1,0 +1,60 @@
+//! The byte classes the scanner stops at, found 16 bytes at a time.
+//! `Keys` holds the delimiter, quote, escape, CR and LF as SIMD lanes;
+//! `marks` gives one bit per byte of a 16-byte block that is one of
+//! them, so the bytes between are skipped without a look at each.
+
+use core::simd::u8x16;
+
+/// The lanes `marks` compares with, and the bit weights it sums.
+pub(pkg) struct Keys {
+    d: u8x16;
+    q: u8x16;
+    e: u8x16;
+    cr: u8x16;
+    lf: u8x16;
+    lo: u8x16;
+    hi: u8x16;
+    zero: u8x16;
+}
+
+impl Keys {
+    /// Keys for `delim`, `quote` and `escape` (256: none, which repeats
+    /// LF, a key anyway); `w` holds the bit weights of the low and the
+    /// high eight lanes.
+    #[inline(always)]
+    pub(pkg) fn new(delim: u8, quote: u32, escape: u32, w: List<u8>) -> Keys {
+        Keys {
+            d: u8x16::splat(delim), q: u8x16::splat(if quote < 256 { quote as u8 } else { 0x0Au8 }),
+            e: u8x16::splat(if escape < 256 { escape as u8 } else { 0x0Au8 }), cr: u8x16::splat(0x0Du8),
+            lf: u8x16::splat(0x0Au8), lo: u8x16::load(w, 0), hi: u8x16::load(w, 16), zero: u8x16::splat(0u8),
+        }
+    }
+}
+
+/// Bit `k` set where `b[at + k]` is a key, for the bytes below `end`;
+/// `b` holds 16 bytes from `at`.
+#[inline(always)]
+pub(pkg) fn marks(b: List<u8>, at: usize, end: usize, k: Keys) -> u32 {
+    let v = u8x16::load(b, at);
+    let m = (v .== k.d) | (v .== k.q) | (v .== k.e) | (v .== k.cr) | (v .== k.lf);
+    let bits = (m.select(k.lo, k.zero).reduce_sum() as u32) | ((m.select(k.hi, k.zero).reduce_sum() as u32) << 8);
+    if at + 16 <= end { bits } else if at >= end { 0u32 } else { bits & ((1u32 << ((end - at) as u32)) - 1u32) }
+}
+
+/// The first key at or after `i` (or `end`), given the block at `blk`
+/// with marks `m`; returns it and the block it is in.
+#[inline(always)]
+pub(pkg) fn next(b: List<u8>, i: usize, end: usize, blk: usize, m: u32, k: Keys) -> (usize, usize, u32) {
+    if i >= blk + 16 {
+        blk = i;
+        m = marks(b, i, end, k);
+    }
+    let left = m & (0xFFFFFFFFu32 << ((i - blk) as u32));
+    while left == 0u32 {
+        blk += 16;
+        if blk >= end { return (end, blk, 0u32); }
+        m = marks(b, blk, end, k);
+        left = m;
+    }
+    (blk + left.trailing_zeros() as usize, blk, m)
+}

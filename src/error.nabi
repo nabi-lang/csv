@@ -1,0 +1,111 @@
+//! `CsvError`: what went wrong, where (line and column, 1-based), and
+//! what to write instead.
+
+use core::io::IoError;
+
+/// The kind of a `CsvError`.
+///
+/// ```nabi
+/// let r = csv::from_str("a,b\n1\n");
+/// let n = try r.count() catch e {
+///     assert(e.kind == csv::ErrorKind::FieldCount);
+///     return;
+/// };
+/// panic(f"read {n}");
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ErrorKind {
+    /// Reading or writing the stream failed.
+    Io,
+    /// The input is not UTF-8.
+    Utf8,
+    /// A quoted field has no closing quote.
+    UnclosedQuote,
+    /// Text follows a closing quote before the delimiter.
+    AfterQuote,
+    /// A record has another field count than the first.
+    FieldCount,
+    /// A field does not convert to the type asked for.
+    Decode,
+    /// The writer cannot write a field as asked.
+    Write,
+}
+
+/// A CSV read, decode or write error.
+///
+/// ```nabi
+/// let r = csv::Dialect::new().has_header(false).from_str("a,\"b\n");
+/// let got = try r.next() catch e {
+///     assert(e.kind == csv::ErrorKind::UnclosedQuote && e.line == 1 && e.column == 3);
+///     assert(f"{e}".starts_with("line 1, column 3: "));
+///     return;
+/// };
+/// panic(f"read {got:?}");
+/// ```
+#[derive(Clone, PartialEq)]
+pub struct CsvError {
+    /// What went wrong.
+    pub kind: ErrorKind;
+    /// The line, 1-based; 0 when there is none.
+    pub line: usize;
+    /// The column in characters, 1-based; 0 when there is none.
+    pub column: usize;
+    /// The field's name (or its number when there is no header), for a
+    /// decode error; else empty.
+    pub field: str;
+    /// The message: what is wrong and what to write instead.
+    pub msg: str;
+}
+
+impl CsvError {
+    /// An error without a position.
+    ///
+    /// ```nabi
+    /// let e = csv::CsvError::new(csv::ErrorKind::Decode, "`x` is not a number");
+    /// assert(f"{e}" == "`x` is not a number");
+    /// ```
+    pub fn new(kind: ErrorKind, msg: str) -> CsvError { CsvError { kind, line: 0, column: 0, field: "", msg } }
+
+    /// The same error at `line`, `column`.
+    ///
+    /// ```nabi
+    /// let e = csv::CsvError::new(csv::ErrorKind::Decode, "bad").at(3, 0);
+    /// assert(f"{e}" == "line 3: bad");
+    /// ```
+    pub fn at(self, line: usize, column: usize) -> CsvError {
+        let e = self;
+        e.line = line;
+        e.column = column;
+        e
+    }
+
+    /// The message with its position, as `Display` writes it.
+    ///
+    /// ```nabi
+    /// let e = csv::CsvError::new(csv::ErrorKind::Io, "disk full");
+    /// assert(e.message() == "disk full");
+    /// ```
+    pub fn message(self) -> str { f"{self}" }
+
+    pub(pkg) fn io(e: IoError) -> CsvError { CsvError::new(ErrorKind::Io, f"{e}") }
+}
+
+impl Display for CsvError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let at = if self.line == 0 {
+            ""
+        } else if self.column > 0 {
+            f"line {self.line}, column {self.column}"
+        } else {
+            f"line {self.line}"
+        };
+        let what = if self.field.is_empty() { at } else if at.is_empty() { f"field `{self.field}`" } else { f"{at}, field `{self.field}`" };
+        try f.write_str(if what.is_empty() { self.msg } else { f"{what}: {self.msg}" })
+    }
+}
+
+impl Debug for CsvError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"CsvError({self})") }
+}
+
+impl Error for CsvError {}

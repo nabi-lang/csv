@@ -1,0 +1,57 @@
+// A large random round trip: random fields of every awkward kind,
+// written in several dialects and read back from strings and streams.
+
+use pkg::{Dialect, QuoteStyle, Record};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+const ALPHABET: [str; 14] = ["a", "b", "Z", "0", " ", "\t", ",", ";", "\"", "'", "\n", "\r", "é", "\\"];
+
+fn field(ref g: Xoshiro256PlusPlus) -> str {
+    let n = g.below(9);
+    let b = StrBuf::new();
+    for _ in 0..n { b.push_str(ALPHABET[g.below(14) as usize]); }
+    b.to_str()
+}
+
+fn table(seed: u64, n: usize, w: usize) -> List<List<str>> {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    List::from_fn(n, |_| List::from_fn(w, |_| field(ref g)))
+}
+
+fn check(d: Dialect, recs: List<List<str>>) {
+    let w = d.to_buffer();
+    for r in recs { try! w.write_record(r); }
+    let s = w.as_str();
+    let back = pkg::tests::suite::rows(d, s);
+    assert(back.len() == recs.len(), f"{back.len()} records of {recs.len()}");
+    for i in 0..recs.len() {
+        assert(back[i] == recs[i], f"record {i}: {back[i]:?} vs {recs[i]:?}");
+    }
+    for step in [17usize, 4093] {
+        assert(pkg::tests::suite::streamed(d.buffer_size(1024), s, step) == recs, f"step {step}");
+    }
+}
+
+#[test]
+fn random_round_trip() {
+    let recs = table(7, 20000, 6);
+    check(Dialect::new().has_header(false), recs);
+    check(Dialect::new().has_header(false).delimiter(';').crlf(true), recs);
+    check(Dialect::new().has_header(false).quote('\'').quote_style(QuoteStyle::Always), recs);
+    check(Dialect::new().has_header(false).escape('\\').double_quotes(false), recs);
+    check(Dialect::tsv().has_header(false), recs);
+}
+
+#[test]
+fn wide_round_trip() {
+    check(Dialect::new().has_header(false), table(11, 500, 200));
+}
+
+#[test]
+fn records_share_the_text() {
+    // Fields read from a string are views of it: they survive the reader.
+    let s = "a,b\n1,2\n3,4\n";
+    let all = try! pkg::from_str(s).read_all();
+    let r = Record::from_list(["1", "2"]);
+    assert(all[0] == r && all[1][1] == "4");
+}

@@ -1,0 +1,77 @@
+// The writer: quoting rules per style, escapes, line ends, field counts,
+// streams.
+
+use pkg::{Dialect, ErrorKind, QuoteStyle, Record};
+
+fn out(d: Dialect, recs: List<List<str>>) -> str {
+    let w = d.to_buffer();
+    for r in recs { try! w.write_record(r); }
+    w.as_str()
+}
+
+#[test]
+fn necessary() {
+    let d = Dialect::new();
+    assert(out(d, [["a", "b c", "d,e", "f\"g", "h\ni", "j\rk", ""]]) == "a,b c,\"d,e\",\"f\"\"g\",\"h\ni\",\"j\rk\",\n");
+    assert(out(d, [[" lead", "trail\t"]]) == "\" lead\",\"trail\t\"\n");
+    // A record of one empty field is written `""`, not a blank line.
+    assert(out(d.flexible(true), [[""], ["", ""]]) == "\"\"\n,\n");
+}
+
+#[test]
+fn styles() {
+    assert(out(Dialect::new().quote_style(QuoteStyle::Always), [["a", ""]]) == "\"a\",\"\"\n");
+    assert(out(Dialect::new().quote_style(QuoteStyle::NonNumeric), [["a", "1.5", "-2", "1e3"]]) == "\"a\",1.5,-2,1e3\n");
+    assert(out(Dialect::new().quote_style(QuoteStyle::Never), [["a", "b"]]) == "a,b\n");
+    let w = Dialect::new().quote_style(QuoteStyle::Never).to_buffer();
+    let failed = false;
+    try w.write_record(["a,b"]) catch e {
+        assert(e.kind == ErrorKind::Write && e.message().contains("QuoteStyle::Necessary"), e.message());
+        failed = true;
+    };
+    assert(failed);
+}
+
+#[test]
+fn escapes_and_dialects() {
+    assert(out(Dialect::new().escape('\\').double_quotes(false), [["a\"b", "c\\d"]]) == "\"a\\\"b\",\"c\\\\d\"\n");
+    assert(out(Dialect::new().delimiter(';'), [["a;b", "c,d"]]) == "\"a;b\";c,d\n");
+    assert(out(Dialect::new().quote('\''), [["it's"]]) == "'it''s'\n");
+    assert(out(Dialect::new().comment('#'), [["#a", "#b"]]) == "\"#a\",#b\n");
+    assert(out(Dialect::new().crlf(true), [["a"], ["b"]]) == "a\r\nb\r\n");
+}
+
+#[test]
+fn field_counts() {
+    let w = Dialect::new().to_buffer();
+    try! w.write_record(["a", "b"]);
+    let failed = false;
+    try w.write_record(["c"]) catch e {
+        assert(e.kind == ErrorKind::FieldCount && e.message().contains("record 2 has 1 fields"), e.message());
+        failed = true;
+    };
+    assert(failed);
+    let f = Dialect::new().flexible(true).to_buffer();
+    try! f.write_record(["a", "b"]);
+    try! f.write_record(["c"]);
+    assert(f.as_str() == "a,b\nc\n");
+}
+
+#[test]
+fn records_back() {
+    let rec = Record::from_list(["x", "y,z"]);
+    let w = Dialect::new().to_buffer();
+    try! w.write(rec);
+    assert(w.as_str() == "x,\"y,z\"\n");
+}
+
+#[test]
+fn to_stream() {
+    let sink: List<u8> = List::new();
+    let w = Dialect::new().writer(core::io::Cursor::new(sink));
+    for i in 0..20000 { try! w.write_record([f"{i}", "v"]); }
+    try! w.flush();
+    let s = try! str::from_utf8(sink[:]);
+    assert(s.starts_with("0,v\n1,v\n") && s.ends_with("19999,v\n"));
+    assert(try! pkg::from_str(s).count() == 19999);
+}

@@ -1,0 +1,69 @@
+// Malformed input: each error has its kind, its line and column, and a
+// message that says what to write.
+
+use pkg::tests::suite::error;
+use pkg::{Dialect, ErrorKind};
+
+fn d() -> Dialect { Dialect::new().has_header(false) }
+
+#[test]
+fn unclosed_quote() {
+    let e = error(d(), "a,b\nc,\"open\nmore\n");
+    assert(e.kind == ErrorKind::UnclosedQuote, e.message());
+    assert(e.line == 2 && e.column == 3, e.message());
+    assert(e.message() == "line 2, column 3: a quoted field is never closed; end it with `\"` (write a quote inside a field as `\"\"`)", e.message());
+    let tail = error(d(), "\"a\"\"");
+    assert(tail.kind == ErrorKind::UnclosedQuote, tail.message());
+    let esc = error(d().escape('\\'), "\"a\\");
+    assert(esc.kind == ErrorKind::UnclosedQuote, esc.message());
+}
+
+#[test]
+fn text_after_quote() {
+    let e = error(d(), "x\n\"ab\"c,d\n");
+    assert(e.kind == ErrorKind::AfterQuote && e.line == 2 && e.column == 5, e.message());
+    assert(e.message().contains("quote the whole field"), e.message());
+    let u = error(d(), "é,\"ü\"x\n");
+    assert(u.column == 6, u.message());
+}
+
+#[test]
+fn field_counts() {
+    let e = error(d(), "a,b\nc,d\ne\n");
+    assert(e.kind == ErrorKind::FieldCount && e.line == 3, e.message());
+    assert(e.message().contains("Dialect::flexible(true)"), e.message());
+}
+
+#[test]
+fn not_utf8() {
+    let bytes: List<u8> = [0x61u8, 0x0Au8, 0x62u8, 0xFFu8, 0x0Au8];
+    let r = d().from_bytes(bytes);
+    let n = try r.count() as i64 catch e {
+        assert(e.kind == ErrorKind::Utf8 && e.line == 2 && e.column == 2, e.message());
+        assert(e.message().contains("convert the file to UTF-8"), e.message());
+        -1
+    };
+    assert(n == -1);
+    let s = d().reader(pkg::tests::suite::Chunks { data: bytes, at: 0, step: 1 });
+    let m = try s.count() as i64 catch e {
+        assert(e.kind == ErrorKind::Utf8 && e.line == 2, e.message());
+        -1
+    };
+    assert(m == -1);
+}
+
+#[test]
+fn edge_inputs() {
+    assert(pkg::tests::suite::plain("") == List::<List<str>>::new());
+    assert(pkg::tests::suite::plain("\n\n\n") == List::<List<str>>::new());
+    let r = pkg::from_str("");
+    assert((try! r.headers()).is_empty() && try! r.next() is none);
+    let only = pkg::from_str("a,b\n");
+    assert((try! only.headers()).len() == 2 && try! only.count() == 0);
+}
+
+#[test]
+fn lone_quote() {
+    let e = error(d(), "\"");
+    assert(e.kind == ErrorKind::UnclosedQuote && e.line == 1 && e.column == 1, e.message());
+}

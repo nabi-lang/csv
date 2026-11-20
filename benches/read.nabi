@@ -1,0 +1,138 @@
+// Read and write three 1e6-row files: short numeric fields (the table
+// bench's, about 31 MB), quoted text with commas, escaped quotes and
+// line breaks (about 60 MB), and wide rows of 20 fields (about 70 MB).
+
+use pkg::{Dialect, Record};
+use core::bench::Bench;
+use core::hint::black_box;
+
+pub fn numeric(n: usize) -> str {
+    let b = StrBuf::new();
+    b.push_str("id,price,tag,day\n");
+    for i in 0..n {
+        b.push_str(f"{i},{(i % 1000) as f64 * 0.25 + 0.125},tag{i % 37},2024-0{i % 9 + 1}-1{i % 10}\n");
+    }
+    b.to_str()
+}
+
+pub fn quoted(n: usize) -> str {
+    let b = StrBuf::new();
+    b.push_str("id,name,comment\n");
+    for i in 0..n {
+        b.push_str(f"{i},\"Smith, John {i % 97}\",\"he said \"\"ok\"\" at {i}, then left\"\n");
+    }
+    b.to_str()
+}
+
+pub fn wide(n: usize) -> str {
+    let b = StrBuf::new();
+    for k in 0..20 {
+        if k > 0 { b.push(','); }
+        b.push_str(f"c{k}");
+    }
+    b.push('\n');
+    for i in 0..n {
+        for k in 0..20 {
+            if k > 0 { b.push(','); }
+            b.push_str(f"{(i * 31 + k * 7) % 100000}");
+        }
+        b.push('\n');
+    }
+    b.to_str()
+}
+
+fn count(s: str) -> usize {
+    let r = pkg::from_str(s);
+    let rec = Record::new();
+    let n: usize = 0;
+    while try! r.read(ref rec) { n += rec.len(); }
+    n
+}
+
+#[bench]
+fn read_numeric(b: Bench) {
+    let s = numeric(1000000);
+    b.set_bytes(s.len() as i64);
+    b.iter(|| count(black_box(s)));
+}
+
+#[bench]
+fn read_quoted(b: Bench) {
+    let s = quoted(1000000);
+    b.set_bytes(s.len() as i64);
+    b.iter(|| count(black_box(s)));
+}
+
+#[bench]
+fn read_wide(b: Bench) {
+    let s = wide(250000);
+    b.set_bytes(s.len() as i64);
+    b.iter(|| count(black_box(s)));
+}
+
+#[bench]
+fn read_numeric_fields(b: Bench) {
+    // Every field as a `str`, as a consumer would take them.
+    let s = numeric(1000000);
+    b.set_bytes(s.len() as i64);
+    b.iter(|| {
+        let r = pkg::from_str(black_box(s));
+        let rec = Record::new();
+        let n: usize = 0;
+        while try! r.read(ref rec) {
+            for i in 0..rec.len() { n += rec[i].len(); }
+        }
+        n
+    });
+}
+
+#[bench]
+fn stream_numeric(b: Bench) {
+    let s = numeric(1000000);
+    let bytes = s.as_bytes().to_list();
+    b.set_bytes(s.len() as i64);
+    b.iter(|| {
+        let r = Dialect::new().reader(core::io::Cursor::new(black_box(bytes)));
+        try! r.count()
+    });
+}
+
+#[bench]
+fn stream_file_numeric(b: Bench) {
+    let s = numeric(1000000);
+    let path = f"{std::env::temp_dir()}/csv-bench-numeric.csv";
+    try! std::fs::write(path, s);
+    b.set_bytes(s.len() as i64);
+    b.iter(|| {
+        let r = pkg::reader(try! std::fs::open(path));
+        let rec = Record::new();
+        let n: usize = 0;
+        while try! r.read(ref rec) { n += rec.len(); }
+        n
+    });
+    _ = try? std::fs::remove_file(path);
+}
+
+#[bench]
+fn write_numeric(b: Bench) {
+    let s = numeric(1000000);
+    let rows = try! pkg::from_str(s).read_all();
+    b.set_bytes(s.len() as i64);
+    b.iter(|| {
+        let w = Dialect::new().to_buffer();
+        for r in black_box(rows) { try! w.write(r); }
+        w.as_str().len()
+    });
+}
+
+#[bench]
+fn write_quoted(b: Bench) {
+    let s = quoted(1000000);
+    let rows = try! pkg::from_str(s).read_all();
+    b.set_bytes(s.len() as i64);
+    b.iter(|| {
+        let w = Dialect::new().to_buffer();
+        for r in black_box(rows) { try! w.write(r); }
+        w.as_str().len()
+    });
+}

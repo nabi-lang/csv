@@ -1,0 +1,368 @@
+//! `Dialect`: how a CSV file is spelled. `Dialect::new()` is RFC 4180
+//! with a header line; each method returns a copy with one thing
+//! changed, and `reader`, `from_str`, `from_bytes` and `writer` start
+//! reading or writing with it.
+
+use pkg::{Reader, Writer};
+use core::collections::{Slice, SliceMut};
+use core::io::IoError;
+
+/// What to strip of blanks (spaces and tabs) around fields. Blanks
+/// inside quotes are kept.
+///
+/// ```nabi
+/// let r = csv::Dialect::new().trim(csv::Trim::Fields).from_str(" a \n x \n");
+/// assert((try! r.headers()).names() == [" a "]);
+/// assert((try! r.next() ?? csv::Record::new())[0] == "x");
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Trim {
+    /// Keep every byte.
+    None,
+    /// Trim the header's names only.
+    Headers,
+    /// Trim data fields only.
+    Fields,
+    /// Trim both.
+    All,
+}
+
+/// When the writer quotes a field.
+///
+/// ```nabi
+/// let w = csv::Dialect::new().quote_style(csv::QuoteStyle::NonNumeric).to_buffer();
+/// try! w.write_record(["a", "1.5"]);
+/// assert(w.as_str() == "\"a\",1.5\n");
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuoteStyle {
+    /// Only fields that need it: they hold the delimiter, a quote, a
+    /// line break, start or end with a blank, or are the empty only
+    /// field of a record.
+    Necessary,
+    /// Every field.
+    Always,
+    /// Every field that does not read as a number.
+    NonNumeric,
+    /// No field; a field that needs quotes is an error.
+    Never,
+}
+
+/// A CSV dialect: delimiter, quoting, comments, trimming and the
+/// writer's line end.
+///
+/// ```nabi
+/// let d = csv::Dialect::new().delimiter(';').comment('#').trim(csv::Trim::All);
+/// let r = d.from_str("# prices\nname ; eur\nbread ; 2,40\n");
+/// let rec = try! r.next() ?? csv::Record::new();
+/// assert(rec[1] == "2,40");
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub struct Dialect {
+    /// The field separator, `,` by default.
+    pub delim: u8;
+    /// The quote, `"` by default; `none` reads quotes as plain text.
+    pub quote: u8 | none;
+    /// An escape inside quotes (often `\`): it makes the next byte
+    /// plain text. `none` by default.
+    pub escape: u8 | none;
+    /// A doubled quote inside quotes is one quote (RFC 4180).
+    pub double_quote: bool;
+    /// A line starting with this byte is skipped. `none` by default.
+    pub comment: u8 | none;
+    /// Blanks stripped around fields.
+    pub trim: Trim;
+    /// Records may have different field counts.
+    pub flexible: bool;
+    /// The first record is the header.
+    pub header: bool;
+    /// Empty lines are skipped (else each is a record of one empty
+    /// field).
+    pub skip_blank: bool;
+    /// What the writer ends each record with, `\n` by default.
+    pub line_end: str;
+    /// When the writer quotes.
+    pub quote_style: QuoteStyle;
+    /// The writer starts with a UTF-8 byte order mark (for Excel).
+    pub bom: bool;
+    /// Bytes read from a stream at a time.
+    pub chunk: usize;
+}
+
+impl Dialect {
+    /// RFC 4180: `,` between fields, `"` quotes with `""` for a quote,
+    /// a header line, blank lines skipped; the writer ends lines with
+    /// `\n`.
+    ///
+    /// ```nabi
+    /// let d = csv::Dialect::new();
+    /// assert(d.delim == 0x2Cu8 && d.header);
+    /// ```
+    pub fn new() -> Dialect {
+        Dialect {
+            delim: 0x2Cu8, quote: 0x22u8, escape: none, double_quote: true, comment: none, trim: Trim::None,
+            flexible: false, header: true, skip_blank: true, line_end: "\n", quote_style: QuoteStyle::Necessary,
+            bom: false, chunk: 1 << 18,
+        }
+    }
+
+    /// Tab-separated values: `Dialect::new()` with a tab between fields.
+    ///
+    /// ```nabi
+    /// let rec = try! csv::Dialect::tsv().from_str("a\tb\n1\t2\n").next() ?? csv::Record::new();
+    /// assert(rec.to_list() == ["1", "2"]);
+    /// ```
+    pub fn tsv() -> Dialect { Dialect::new().delimiter('\t') }
+
+    /// Fields separated by `c`, one ASCII character other than a quote
+    /// or a line break.
+    ///
+    /// ```nabi
+    /// assert(csv::Dialect::new().delimiter(';').delim == 0x3Bu8);
+    /// ```
+    #[track_caller]
+    pub fn delimiter(self, c: char) -> Dialect {
+        let d = self;
+        d.delim = ascii(c, "delimiter");
+        if d.delim == 0x0Au8 || d.delim == 0x0Du8 || (d.quote ?? 0u8) == d.delim && d.quote is u8 {
+            panic(f"{c:?} cannot be the delimiter: it is a line break or the quote; pick another, such as `,` or `;`");
+        }
+        d
+    }
+
+    /// The quote character (ASCII).
+    ///
+    /// ```nabi
+    /// let rec = try! csv::Dialect::new().quote('\'').has_header(false).from_str("'a,b',c\n").next() ?? csv::Record::new();
+    /// assert(rec[0] == "a,b");
+    /// ```
+    #[track_caller]
+    pub fn quote(self, c: char) -> Dialect {
+        let d = self;
+        d.quote = ascii(c, "quote");
+        d
+    }
+
+    /// Quotes are plain text: no field is quoted.
+    ///
+    /// ```nabi
+    /// let rec = try! csv::Dialect::new().no_quotes().has_header(false).from_str("\"a,b\n").next() ?? csv::Record::new();
+    /// assert(rec.to_list() == ["\"a", "b"]);
+    /// ```
+    pub fn no_quotes(self) -> Dialect {
+        let d = self;
+        d.quote = none;
+        d
+    }
+
+    /// An escape inside quotes: `\"` is a quote and `\\` a backslash
+    /// when `c` is `\`. The writer escapes quotes with it unless
+    /// `double_quotes(true)` is also set.
+    ///
+    /// ```nabi
+    /// let d = csv::Dialect::new().escape('\\').double_quotes(false).has_header(false);
+    /// let rec = try! d.from_str("\"say \\\"hi\\\"\",x\n").next() ?? csv::Record::new();
+    /// assert(rec[0] == "say \"hi\"");
+    /// ```
+    #[track_caller]
+    pub fn escape(self, c: char) -> Dialect {
+        let d = self;
+        d.escape = ascii(c, "escape");
+        d
+    }
+
+    /// Whether `""` inside quotes is one quote (`true` by default).
+    ///
+    /// ```nabi
+    /// assert(!csv::Dialect::new().double_quotes(false).double_quote);
+    /// ```
+    pub fn double_quotes(self, yes: bool) -> Dialect {
+        let d = self;
+        d.double_quote = yes;
+        d
+    }
+
+    /// Lines starting with `c` are comments and skipped.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().comment('#').has_header(false).from_str("# note\n1,2\n");
+    /// assert((try! r.next() ?? csv::Record::new()).to_list() == ["1", "2"]);
+    /// ```
+    #[track_caller]
+    pub fn comment(self, c: char) -> Dialect {
+        let d = self;
+        d.comment = ascii(c, "comment");
+        d
+    }
+
+    /// Strip blanks around fields, outside quotes.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().trim(csv::Trim::All).has_header(false).from_str(" a ,  \"b \" \n");
+    /// assert((try! r.next() ?? csv::Record::new()).to_list() == ["a", "b "]);
+    /// ```
+    pub fn trim(self, t: Trim) -> Dialect {
+        let d = self;
+        d.trim = t;
+        d
+    }
+
+    /// Allow records with different field counts. Off by default: a
+    /// record that differs from the first is an error.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().flexible(true).has_header(false).from_str("1,2\n3\n");
+    /// _ = try! r.next();
+    /// assert((try! r.next() ?? csv::Record::new()).len() == 1);
+    /// ```
+    pub fn flexible(self, yes: bool) -> Dialect {
+        let d = self;
+        d.flexible = yes;
+        d
+    }
+
+    /// Whether the first record is the header (`true` by default). The
+    /// header is not returned by `Reader::next`; `Reader::headers` has it.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().has_header(false).from_str("a,b\n");
+    /// assert((try! r.next() ?? csv::Record::new())[0] == "a");
+    /// ```
+    pub fn has_header(self, yes: bool) -> Dialect {
+        let d = self;
+        d.header = yes;
+        d
+    }
+
+    /// Whether empty lines are skipped (`true` by default). When kept,
+    /// each is a record with one empty field.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().skip_blank_lines(false).has_header(false).from_str("a\n\nb\n");
+    /// _ = try! r.next();
+    /// assert((try! r.next() ?? csv::Record::new()).to_list() == [""]);
+    /// ```
+    pub fn skip_blank_lines(self, yes: bool) -> Dialect {
+        let d = self;
+        d.skip_blank = yes;
+        d
+    }
+
+    /// End written records with `\r\n` (RFC 4180) instead of `\n`.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().crlf(true).to_buffer();
+    /// try! w.write_record(["a", "b"]);
+    /// assert(w.as_str() == "a,b\r\n");
+    /// ```
+    pub fn crlf(self, yes: bool) -> Dialect {
+        let d = self;
+        d.line_end = if yes { "\r\n" } else { "\n" };
+        d
+    }
+
+    /// When the writer quotes fields.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().quote_style(csv::QuoteStyle::Always).to_buffer();
+    /// try! w.write_record(["a", "1"]);
+    /// assert(w.as_str() == "\"a\",\"1\"\n");
+    /// ```
+    pub fn quote_style(self, s: QuoteStyle) -> Dialect {
+        let d = self;
+        d.quote_style = s;
+        d
+    }
+
+    /// Start the written output with a UTF-8 byte order mark, which
+    /// Excel needs to read UTF-8. Readers always skip one.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().write_bom(true).to_buffer();
+    /// try! w.write_record(["é"]);
+    /// assert(w.as_str() == "\u{FEFF}é\n");
+    /// ```
+    pub fn write_bom(self, yes: bool) -> Dialect {
+        let d = self;
+        d.bom = yes;
+        d
+    }
+
+    /// Read streams `n` bytes at a time (256 KiB by default). A record
+    /// longer than that grows the buffer.
+    ///
+    /// ```nabi
+    /// assert(csv::Dialect::new().buffer_size(4096).chunk == 4096);
+    /// ```
+    pub fn buffer_size(self, n: usize) -> Dialect {
+        let d = self;
+        d.chunk = n.max(64);
+        d
+    }
+
+    /// A reader over the stream `r`, read in chunks.
+    ///
+    /// ```nabi
+    /// let bytes = "a,b\n1,2\n".as_bytes().to_list();
+    /// let r = csv::Dialect::new().reader(core::io::Cursor::new(bytes));
+    /// assert((try! r.next() ?? csv::Record::new())[1] == "2");
+    /// ```
+    pub fn reader<R: Read>(self, r: R) -> Reader {
+        let fill: fn(SliceMut<u8>) throws (IoError) -> usize = [ref r] |b| try r.read(b);
+        Reader::stream(self, fill)
+    }
+
+    /// A reader over the text `s`. Fields are views of `s`, not copies.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().from_str("x\n1\n2\n");
+    /// assert(try! r.count() == 2);
+    /// ```
+    pub fn from_str(self, s: str) -> Reader { Reader::text(self, s) }
+
+    /// A reader over UTF-8 bytes; not UTF-8 is an error on the first
+    /// read.
+    ///
+    /// ```nabi
+    /// let r = csv::Dialect::new().from_bytes("a\nä\n".as_bytes().to_list());
+    /// assert((try! r.next() ?? csv::Record::new())[0] == "ä");
+    /// ```
+    pub fn from_bytes(self, b: List<u8>) -> Reader { Reader::bytes(self, b) }
+
+    /// A writer to the stream `w`; `flush` (or `close`) writes what is
+    /// buffered.
+    ///
+    /// ```nabi
+    /// let out: List<u8> = List::new();
+    /// let w = csv::Dialect::new().writer(core::io::Cursor::new(out));
+    /// try! w.write_record(["a"]);
+    /// try! w.flush();
+    /// ```
+    pub fn writer<W: Write>(self, w: W) -> Writer {
+        let sink: fn(Slice<u8>) throws (IoError) = [ref w] |b| {
+            try w.write_all(b);
+            try w.flush();
+        };
+        Writer::stream(self, sink)
+    }
+
+    /// A writer that keeps the output in memory: `as_str` gives it.
+    ///
+    /// ```nabi
+    /// let w = csv::Dialect::new().to_buffer();
+    /// try! w.write_record(["a,b", "c"]);
+    /// assert(w.as_str() == "\"a,b\",c\n");
+    /// ```
+    pub fn to_buffer(self) -> Writer { Writer::memory(self) }
+}
+
+impl Default for Dialect {
+    fn default() -> Dialect { Dialect::new() }
+}
+
+#[track_caller]
+fn ascii(c: char, what: str) -> u8 {
+    let n = c as u32;
+    if n >= 128 { panic(f"the {what} must be one ASCII character, not `{c}`; non-ASCII text can still appear inside fields"); }
+    n as u8
+}

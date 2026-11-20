@@ -1,0 +1,82 @@
+// Streams: the same records whatever the read size and buffer size,
+// records longer than the buffer, a line end split between reads.
+
+use pkg::Dialect;
+use pkg::tests::suite::{rows, streamed};
+
+fn sample() -> str {
+    let b = StrBuf::new();
+    b.push_str("\u{FEFF}id,text,x\r\n");
+    for i in 0..300 {
+        b.push_str(f"{i},\"row {i}, with \"\"quotes\"\"\nand a break ü\",{i}.5\r\n");
+        if i % 50 == 0 { b.push_str("\r\n"); }
+    }
+    b.to_str()
+}
+
+#[test]
+fn every_step() {
+    let s = sample();
+    let whole = rows(Dialect::new(), s);
+    assert(whole.len() == 300);
+    for step in [1usize, 2, 3, 7, 64, 4096, 1000000] {
+        assert(streamed(Dialect::new(), s, step) == whole, f"step {step}");
+    }
+}
+
+#[test]
+fn small_buffers() {
+    let s = sample();
+    let whole = rows(Dialect::new(), s);
+    for size in [64usize, 100, 256] {
+        for step in [5usize, 1000] {
+            assert(streamed(Dialect::new().buffer_size(size), s, step) == whole, f"buffer {size} step {step}");
+        }
+    }
+}
+
+#[test]
+fn long_record() {
+    let big = "x".repeat(10000);
+    let s = f"a,b\n\"{big}\",1\n{big},2\n";
+    let got = streamed(Dialect::new().buffer_size(64), s, 333);
+    assert(got.len() == 2 && got[0][0] == big && got[1][0] == big && got[1][1] == "2");
+}
+
+#[test]
+fn split_crlf() {
+    // CR at the end of one read, LF at the start of the next.
+    let s = "a\r\nb\r\n\r\nc";
+    for step in [1usize, 2, 3] {
+        assert(streamed(Dialect::new().has_header(false), s, step) == [["a"], ["b"], ["c"]], f"step {step}");
+        assert(streamed(Dialect::new().has_header(false).skip_blank_lines(false), s, step) == [["a"], ["b"], [""], ["c"]], f"keep, step {step}");
+    }
+}
+
+#[test]
+fn comments_streamed() {
+    let s = "# one\r\na,b\r\n# two\r\n1,2\r\n#";
+    for step in [1usize, 4, 100] {
+        assert(streamed(Dialect::new().comment('#'), s, step) == [["1", "2"]], f"step {step}");
+    }
+}
+
+#[test]
+fn positions_streamed() {
+    let s = sample();
+    let r = Dialect::new().buffer_size(64).reader(pkg::tests::suite::Chunks { data: s.as_bytes().to_list(), at: 0, step: 13 });
+    let rec = pkg::Record::new();
+    let lines: List<usize> = List::new();
+    let pos: List<u64> = List::new();
+    while try! r.read(ref rec) {
+        lines.push(rec.line());
+        pos.push(rec.position());
+    }
+    let m = pkg::from_str(s);
+    let k: usize = 0;
+    while try! m.read(ref rec) {
+        assert(rec.line() == lines[k] && rec.position() == pos[k], f"record {k}");
+        k += 1;
+    }
+    assert(k == 300 && lines[0] == 2 && lines[1] == 5);
+}

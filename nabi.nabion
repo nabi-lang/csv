@@ -1,0 +1,12 @@
+Package {
+    name: "csv",
+    version: "0.1.0",
+    nabi_version: "0.1.0",
+    toolchain: "0.1",
+    description: "Fast streaming CSV (RFC 4180 and common dialects): SIMD record scanning, borrowed fields, typed rows with #[derive(Csv)], a correct writer",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/nabi-lang/csv",
+    keywords: ["csv", "tsv", "parser", "serialization", "encoding"],
+    categories: ["encoding", "parser-implementations"],
+    deps: {},
+}

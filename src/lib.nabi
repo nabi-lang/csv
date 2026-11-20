@@ -1,0 +1,138 @@
+//! CSV (RFC 4180) and its common dialects: a streaming `Reader` over
+//! any `Read`, a `str` or bytes; `Record`s whose fields are views of
+//! the input; typed rows with `#[derive(Csv)]`, matched to the header by
+//! name; and a `Writer` that quotes only what needs it.
+//!
+//! The reader finds delimiters, quotes and line ends 16 bytes at a time
+//! with `core::simd`, so the bytes of a field are not looked at one by
+//! one. A stream is read in chunks (256 KiB by default): memory stays
+//! flat however long the input.
+
+pub mod decode;
+pub mod dialect;
+pub mod error;
+pub mod read;
+pub mod record;
+pub mod write;
+
+mod scan;
+
+pub use decode::{Columns, Cursor, FromField, FromRecord, Rows, ToField, ToRecord};
+pub use dialect::{Dialect, QuoteStyle, Trim};
+pub use error::{CsvError, ErrorKind};
+pub use read::Reader;
+pub use record::{Fields, Headers, Record};
+pub use write::Writer;
+
+/// A reader over the stream `r` with `Dialect::new()`: a header line,
+/// `,` between fields.
+///
+/// ```nabi norun
+/// let f = try! std::fs::open("prices.csv");
+/// let r = csv::reader(f);
+/// try! for rec in r { println(rec[0]); }
+/// ```
+pub fn reader<R: Read>(r: R) -> Reader { Dialect::new().reader(r) }
+
+/// A reader over the text `s` with `Dialect::new()`.
+///
+/// ```nabi
+/// let r = csv::from_str("a,b\n1,2\n");
+/// assert((try! r.next() ?? csv::Record::new()).to_list() == ["1", "2"]);
+/// ```
+pub fn from_str(s: str) -> Reader { Dialect::new().from_str(s) }
+
+/// A reader over UTF-8 bytes with `Dialect::new()`.
+///
+/// ```nabi
+/// let r = csv::from_bytes("a\n1\n".as_bytes().to_list());
+/// assert(try! r.count() == 1);
+/// ```
+pub fn from_bytes(b: List<u8>) -> Reader { Dialect::new().from_bytes(b) }
+
+/// A writer to the stream `w` with `Dialect::new()`.
+///
+/// ```nabi
+/// let out: List<u8> = List::new();
+/// let w = csv::writer(core::io::Cursor::new(out));
+/// try! w.write_record(["a", "b"]);
+/// try! w.flush();
+/// assert(out.len() == 4);
+/// ```
+pub fn writer<W: Write>(w: W) -> Writer { Dialect::new().writer(w) }
+
+/// `rows` as CSV text with a header, `Dialect::new()`.
+///
+/// ```nabi
+/// #[derive(csv::Csv)]
+/// struct P { name: str; n: i32; }
+///
+/// let s = try! csv::to_str([P { name: "a,b", n: 1 }]);
+/// assert(s == "name,n\n\"a,b\",1\n");
+/// ```
+pub fn to_str<T: ToRecord>(rows: List<T>) throws (CsvError) -> str {
+    let w = Dialect::new().to_buffer();
+    if rows.is_empty() { try w.write_record(T::header()); }
+    for x in rows { try w.serialize(x); }
+    w.as_str()
+}
+
+/// `#[derive(Csv)]`: `FromRecord` and `ToRecord` for a struct with
+/// named fields. Each field is the column of its name; a field of type
+/// `T | none` is `none` for an empty field or a missing column, and a
+/// field with a default (`n: i32 = 0`) takes it there.
+///
+/// ```nabi
+/// #[derive(csv::Csv, Debug)]
+/// struct Trip { id: u64; fare: f64; tip: f64 = 0.0; note: str | none; }
+///
+/// let trips = try! csv::from_str("fare,id,tip\n12.5,1,2\n8,2,\n").decode::<Trip>().collect::<List<Trip>>();
+/// assert(trips[1].id == 2 && trips[1].tip == 0.0 && trips[0].note is none);
+/// ```
+#[impl_derive(Csv)]
+pub @derive {
+    impl pkg::FromRecord for @Self {
+        fn columns() -> List<str> {
+            let names: List<str> = List::new();
+            @for_fields {
+                names.push(@field.name.as_str());
+            }
+            return names;
+        }
+
+        fn from_record(r: pkg::Record, c: pkg::Columns) throws (pkg::CsvError) -> Self {
+            let at = pkg::Cursor::new(r, c);
+            return @Self {
+                @for_fields {
+                    @apply_if(@field.has_default) {
+                        @field: if at.has() {
+                            try at.next::<@field.type>()
+                        } else {
+                            at.skip();
+                            @field.default
+                        },
+                    }
+                    @apply_if(!@field.has_default) {
+                        @field: try at.next::<@field.type>(),
+                    }
+                }
+            };
+        }
+    }
+
+    impl pkg::ToRecord for @Self {
+        fn header() -> List<str> {
+            let names: List<str> = List::new();
+            @for_fields {
+                names.push(@field.name.as_str());
+            }
+            return names;
+        }
+
+        fn to_record(self, out: List<str>) {
+            @for_fields {
+                out.push(pkg::ToField::to_field(self.@field));
+            }
+        }
+    }
+}

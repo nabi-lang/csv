@@ -1,0 +1,316 @@
+//! Typed rows. `FromField` / `ToField` convert one field; `FromRecord`
+//! / `ToRecord` (written by `#[derive(Csv)]`) a whole row, its fields
+//! matched to the header by name.
+
+use pkg::{CsvError, ErrorKind, Headers, Reader, Record};
+
+/// A type one field converts to.
+///
+/// ```nabi
+/// use csv::FromField;
+/// assert(try! i32::from_field("-7") == -7);
+/// let blank: bool | none = try! FromField::from_field("");
+/// assert(blank is none);
+/// ```
+pub trait FromField {
+    /// The value of field text `s`.
+    fn from_field(s: str) throws (CsvError) -> Self;
+
+    /// The value for a column the row does not have.
+    fn from_missing() throws (CsvError) -> Self {
+        throw CsvError::new(ErrorKind::Decode, f"the row has no such column; add it, make the field `{Self::type_name()} | none`, or give it a default (`= ..`)");
+    }
+}
+
+/// A type that writes as one field.
+///
+/// ```nabi
+/// use csv::ToField;
+/// let n: i32 | none = none;
+/// assert(2.5.to_field() == "2.5" && n.to_field() == "");
+/// ```
+pub trait ToField {
+    /// The field text.
+    fn to_field(self) -> str;
+}
+
+/// A row type: `#[derive(Csv)]` writes it.
+///
+/// ```nabi
+/// #[derive(csv::Csv)]
+/// struct P { x: f64; y: f64; }
+///
+/// use csv::FromRecord;
+/// assert(P::columns() == ["x", "y"]);
+/// ```
+pub trait FromRecord {
+    /// The column names, in field order.
+    fn columns() -> List<str>;
+
+    /// The row `r`, its fields at the positions `c` gives.
+    fn from_record(r: Record, c: Columns) throws (CsvError) -> Self;
+}
+
+/// A row type the writer takes: `#[derive(Csv)]` writes it.
+///
+/// ```nabi
+/// #[derive(csv::Csv)]
+/// struct P { x: i32; tag: str; }
+///
+/// use csv::ToRecord;
+/// let out: List<str> = List::new();
+/// P { x: 1, tag: "a" }.to_record(out);
+/// assert(P::header() == ["x", "tag"] && out == ["1", "a"]);
+/// ```
+pub trait ToRecord {
+    /// The header's names.
+    fn header() -> List<str>;
+
+    /// The fields, appended to `out`.
+    fn to_record(self, out: List<str>);
+}
+
+/// Where each field of a row type is in the records: a position per
+/// field, `usize::MAX` for a column the header lacks.
+///
+/// ```nabi
+/// let c = csv::Columns::of(["b", "z"], csv::Headers::new(["a", "b"]));
+/// assert(c.position(0) == 1usize && c.position(1) is none);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Columns {
+    names: List<str>;
+    at: List<usize>;
+}
+
+impl Columns {
+    /// The positions of `names` in `h`; without a header (`h` empty),
+    /// field `k` is column `k`.
+    ///
+    /// ```nabi
+    /// let c = csv::Columns::of(["a", "b"], csv::Headers::new([]));
+    /// assert(c.position(1) == 1usize);
+    /// ```
+    pub fn of(names: List<str>, h: Headers) -> Columns {
+        let at: List<usize> = List::with_capacity(names.len());
+        for k in 0..names.len() {
+            at.push(if h.is_empty() { k } else { h.index(names[k]) ?? usize::MAX });
+        }
+        Columns { names, at }
+    }
+
+    /// The column of field `k`, or `none` when the header lacks it.
+    ///
+    /// ```nabi
+    /// assert(csv::Columns::of(["a"], csv::Headers::new(["a"])).position(0) == 0usize);
+    /// ```
+    pub fn position(self, k: usize) -> usize | none {
+        let p = self.at.get(k) ?? usize::MAX;
+        if p == usize::MAX { none } else { p }
+    }
+}
+
+/// Reads one row's fields in order, for `#[derive(Csv)]`.
+///
+/// ```nabi
+/// let rec = csv::Record::from_list(["4", "x"]);
+/// let c = csv::Cursor::new(rec, csv::Columns::of(["n", "s"], csv::Headers::new([])));
+/// let n = try! c.next::<i64>();
+/// let s = try! c.next::<str>();
+/// assert(n == 4 && s == "x");
+/// ```
+pub struct Cursor {
+    r: Record;
+    c: Columns;
+    k: usize;
+}
+
+impl Cursor {
+    /// A cursor at the first field of `r`.
+    ///
+    /// ```nabi
+    /// let c = csv::Cursor::new(csv::Record::new(), csv::Columns::of([], csv::Headers::new([])));
+    /// assert(!c.has());
+    /// ```
+    pub fn new(r: Record, c: Columns) -> Cursor { Cursor { r, c, k: 0 } }
+
+    /// Whether the next field is there and not empty.
+    ///
+    /// ```nabi
+    /// let c = csv::Cursor::new(csv::Record::from_list([""]), csv::Columns::of(["a"], csv::Headers::new([])));
+    /// assert(!c.has());
+    /// ```
+    pub fn has(self) -> bool {
+        let p = self.c.at.get(self.k) ?? usize::MAX;
+        p < self.r.len() && !self.r.blank(p)
+    }
+
+    /// Step over the next field.
+    ///
+    /// ```nabi
+    /// let c = csv::Cursor::new(csv::Record::from_list(["1", "2"]), csv::Columns::of(["a", "b"], csv::Headers::new([])));
+    /// c.skip();
+    /// assert(try! c.next::<i32>() == 2);
+    /// ```
+    pub fn skip(ref self) { self.k += 1; }
+
+    /// The next field as a `T`.
+    ///
+    /// ```nabi
+    /// let c = csv::Cursor::new(csv::Record::from_list(["x"]), csv::Columns::of(["n"], csv::Headers::new([])));
+    /// let n = try c.next::<i32>() catch e {
+    ///     assert(e.message().ends_with("field `n`: `x` is not a whole number that fits in i32; write one such as `42`"));
+    ///     return;
+    /// };
+    /// panic(f"read {n}");
+    /// ```
+    pub fn next<T: FromField>(ref self) throws (CsvError) -> T {
+        let k = self.k;
+        self.k += 1;
+        let p = self.c.at.get(k) ?? usize::MAX;
+        let name = self.c.names.get(k) ?? f"{k + 1}";
+        if p >= self.r.len() {
+            return try T::from_missing() catch e {
+                let out = e.at(self.r.line(), 0);
+                out.field = name;
+                throw out;
+            };
+        }
+        try T::from_field(self.r.field(p)) catch e {
+            let out = e.at(self.r.line_of(p), self.r.column_of(p));
+            out.field = name;
+            throw out;
+        }
+    }
+}
+
+/// `Reader::decode`: the rows as `T`s.
+///
+/// ```nabi
+/// #[derive(csv::Csv)]
+/// struct Row { a: i32; b: i32 | none; }
+///
+/// let rows = try! csv::from_str("a,b\n1,2\n3,\n").decode::<Row>().collect::<List<Row>>();
+/// assert(rows.len() == 2 && rows[1].b is none);
+/// ```
+pub struct Rows<T> {
+    r: Reader;
+    c: Columns | none;
+    rec: Record;
+}
+
+impl<T: FromRecord> Rows<T> {
+    pub(pkg) fn new(r: Reader) -> Rows<T> { Rows { r, c: none, rec: Record::new() } }
+}
+
+impl<T: FromRecord> TryIterator for Rows<T> {
+    type Item = T;
+    type Error = CsvError;
+
+    /// The next row, or `none` at the end.
+    fn next(ref self) throws (CsvError) -> T | none {
+        let c = match self.c {
+            c: Columns => c,
+            none => {
+                let c = Columns::of(T::columns(), try self.r.headers());
+                self.c = c;
+                c
+            },
+        };
+        if !(try self.r.read(ref self.rec)) { return none; }
+        try T::from_record(self.rec, c)
+    }
+}
+
+fn bad(s: str, want: str) -> CsvError { CsvError::new(ErrorKind::Decode, f"`{s}` is not {want}") }
+
+impl FromField for str {
+    fn from_field(s: str) throws (CsvError) -> str { s }
+}
+
+impl ToField for str {
+    fn to_field(self) -> str { self }
+}
+
+impl FromField for char {
+    fn from_field(s: str) throws (CsvError) -> char {
+        let it = s.chars();
+        let c = it.next() ?? throw CsvError::new(ErrorKind::Decode, "an empty field is not a char; write one character, or make the field `char | none`");
+        if !(it.next() is none) { throw bad(s, "one character"); }
+        c
+    }
+}
+
+impl ToField for char {
+    fn to_field(self) -> str { f"{self}" }
+}
+
+impl FromField for bool {
+    fn from_field(s: str) throws (CsvError) -> bool {
+        if s == "true" || s == "TRUE" || s == "True" { return true; }
+        if s == "false" || s == "FALSE" || s == "False" { return false; }
+        throw bad(s, "a bool; write `true` or `false`");
+    }
+}
+
+impl ToField for bool {
+    fn to_field(self) -> str { if self { "true" } else { "false" } }
+}
+
+// Every integer type: digits with an optional sign, no blanks.
+#[impl_macro(csv_int)] @macro {
+    (@rep[sep = ","] { @t: ty }) => {
+        @for @t {
+            impl FromField for @t {
+                fn from_field(s: str) throws (CsvError) -> @t {
+                    try s.parse::<@t>() catch _ {
+                        if s.is_empty() { throw CsvError::new(ErrorKind::Decode, f"an empty field is not a number; write one, or make the field `{@t::type_name()} | none`"); }
+                        throw bad(s, f"a whole number that fits in {@t::type_name()}; write one such as `42`");
+                    }
+                }
+            }
+            impl ToField for @t {
+                fn to_field(self) -> str { f"{self}" }
+            }
+        }
+    }
+}
+csv_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
+// Both float types: decimal or exponent forms, `inf`, `nan`.
+#[impl_macro(csv_float)] @macro {
+    (@rep[sep = ","] { @t: ty }) => {
+        @for @t {
+            impl FromField for @t {
+                fn from_field(s: str) throws (CsvError) -> @t {
+                    try s.parse::<@t>() catch _ {
+                        if s.is_empty() { throw CsvError::new(ErrorKind::Decode, f"an empty field is not a number; write one, or make the field `{@t::type_name()} | none`"); }
+                        throw bad(s, "a number; write one such as `1.5` or `2e-3`");
+                    }
+                }
+            }
+            impl ToField for @t {
+                fn to_field(self) -> str { f"{self}" }
+            }
+        }
+    }
+}
+csv_float!(f32, f64);
+
+impl<T: FromField> FromField for T | none {
+    fn from_field(s: str) throws (CsvError) -> T | none {
+        if s.is_empty() { return none; }
+        try T::from_field(s)
+    }
+
+    fn from_missing() throws (CsvError) -> T | none { none }
+}
+
+impl<T: ToField> ToField for T | none {
+    fn to_field(self) -> str {
+        match self {
+            none => "",
+            x: T => x.to_field(),
+        }
+    }
+}

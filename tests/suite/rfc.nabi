@@ -1,0 +1,73 @@
+// The examples of RFC 4180 section 2, in order.
+
+use pkg::tests::suite::plain;
+
+#[test]
+fn line_breaks() {
+    // 1. Each record on its own line, ended by CRLF.
+    assert(plain("aaa,bbb,ccc\r\nzzz,yyy,xxx\r\n") == [["aaa", "bbb", "ccc"], ["zzz", "yyy", "xxx"]]);
+    // 2. The last record may have no line end.
+    assert(plain("aaa,bbb,ccc\r\nzzz,yyy,xxx") == [["aaa", "bbb", "ccc"], ["zzz", "yyy", "xxx"]]);
+}
+
+#[test]
+fn header() {
+    // 3. An optional header line of the same form.
+    let r = pkg::from_str("field_name,field_name,field_name\r\naaa,bbb,ccc\r\nzzz,yyy,xxx\r\n");
+    let h = try! r.headers();
+    assert(h.names() == ["field_name", "field_name", "field_name"]);
+    assert(try! r.count() == 2);
+}
+
+#[test]
+fn fields() {
+    // 4. Fields separated by commas; spaces are part of a field; no comma
+    // after the last field.
+    assert(plain("aaa,bbb,ccc") == [["aaa", "bbb", "ccc"]]);
+    assert(plain(" a , b ") == [[" a ", " b "]]);
+}
+
+#[test]
+fn quotes() {
+    // 5. Fields may be quoted.
+    assert(plain("\"aaa\",\"bbb\",\"ccc\"\r\nzzz,yyy,xxx") == [["aaa", "bbb", "ccc"], ["zzz", "yyy", "xxx"]]);
+    // 6. Line breaks, quotes and commas inside quotes.
+    assert(plain("\"aaa\",\"b\r\nbb\",\"ccc\"\r\nzzz,yyy,xxx") == [["aaa", "b\r\nbb", "ccc"], ["zzz", "yyy", "xxx"]]);
+    // 7. A quote inside quotes is doubled.
+    assert(plain("\"aaa\",\"b\"\"bb\",\"ccc\"") == [["aaa", "b\"bb", "ccc"]]);
+}
+
+#[test]
+fn empty_fields() {
+    assert(plain(",\n") == [["", ""]]);
+    assert(plain("a,,b\n") == [["a", "", "b"]]);
+    assert(plain("a,") == [["a", ""]]);
+    assert(plain("\"\"\n") == [[""]]);
+    assert(plain("\"\",\"\"") == [["", ""]]);
+}
+
+#[test]
+fn line_ends() {
+    assert(plain("a\rb\r") == [["a"], ["b"]]);
+    assert(plain("a\nb\r\nc\rd") == [["a"], ["b"], ["c"], ["d"]]);
+    assert(plain("\"x\r\ny\"\n") == [["x\r\ny"]]);
+    // Blank lines are skipped.
+    assert(plain("\n\na\n\r\n\rb\n\n") == [["a"], ["b"]]);
+}
+
+#[test]
+fn bom_and_positions() {
+    let r = pkg::from_str("\u{FEFF}id,name\n1,\"ann\nlee\"\n2,bob\n");
+    assert((try! r.headers()).names() == ["id", "name"]);
+    let a = try! r.next() ?? pkg::Record::new();
+    let b = try! r.next() ?? pkg::Record::new();
+    assert(a.line() == 2 && b.line() == 4, f"{a.line()} {b.line()}");
+    assert(a[1] == "ann\nlee" && b[1] == "bob");
+    assert(a.position() == 11);
+    assert(try! r.next() is none);
+}
+
+#[test]
+fn unicode() {
+    assert(plain("é,\"ü,ß\",日本\n") == [["é", "ü,ß", "日本"]]);
+}
