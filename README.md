@@ -162,7 +162,7 @@ at `-O2`.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/csv/latest/docs
+https://docs.nabi-lang.org/packages/csv/latest
 
 ## License
 
