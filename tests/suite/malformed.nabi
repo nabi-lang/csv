@@ -67,3 +67,61 @@ fn lone_quote() {
     let e = error(d(), "\"");
     assert(e.kind == ErrorKind::UnclosedQuote && e.line == 1 && e.column == 1, e.message());
 }
+
+#[derive(pkg::Csv)]
+struct Pair { a: i64; b: i64; }
+
+/// Reads with `next`, skipping errors, until the end (or 100 calls):
+/// the records read and the errors seen.
+fn skim(r: pkg::Reader) -> (usize, List<ErrorKind>) {
+    let n: usize = 0;
+    let errs: List<ErrorKind> = List::new();
+    for _ in 0..100 {
+        let got = try r.next() catch e {
+            errs.push(e.kind);
+            continue;
+        };
+        if got is none { return (n, errs); }
+        n += 1;
+    }
+    panic(f"no end after 100 calls: {n} records, errors {errs:?}");
+}
+
+#[test]
+fn structural_error_ends() {
+    let flex = Dialect::new().flexible(true);
+    let rows = flex.from_str("a,b\n1,\"x\n2,3\n").decode::<Pair>();
+    let calls: usize = 0;
+    let errs: List<ErrorKind> = List::new();
+    loop {
+        calls += 1;
+        assert(calls < 100, "the loop does not end");
+        let r = try rows.next() catch e {
+            errs.push(e.kind);
+            continue;
+        };
+        if r is none { break; }
+    }
+    assert(errs == [ErrorKind::UnclosedQuote], f"{errs:?}");
+
+    let (n, e) = skim(d().from_str("1\n2\n\"ab\"c\n3\n"));
+    assert(n == 2 && e == [ErrorKind::AfterQuote], f"{n} {e:?}");
+    let bytes: List<u8> = [0x61u8, 0x0Au8, 0x62u8, 0xFFu8, 0x0Au8, 0x63u8, 0x0Au8];
+    let (n, e) = skim(d().from_bytes(bytes));
+    assert(n == 0 && e == [ErrorKind::Utf8], f"{n} {e:?}");
+    let s = d().reader(pkg::tests::suite::Chunks { data: "a\n\"b\nc\n".as_bytes().to_list(), at: 0, step: 1 });
+    let (n, e) = skim(s);
+    assert(n == 1 && e == [ErrorKind::UnclosedQuote], f"{n} {e:?}");
+    let cols: List<List<str>> = [List::new()];
+    let quoted: List<List<usize>> = [List::new()];
+    let r = d().from_str("\"a\n");
+    let got = try r.read_columns(cols, quoted, 10) catch _ { 7 };
+    assert(got == 7);
+    assert(try! r.read_columns(cols, quoted, 10) == 0);
+}
+
+#[test]
+fn field_count_goes_on() {
+    let (n, e) = skim(Dialect::new().from_str("a,b\n1,2\n3\n4,5\n"));
+    assert(n == 2 && e == [ErrorKind::FieldCount], f"{n} {e:?}");
+}

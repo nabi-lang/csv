@@ -116,6 +116,12 @@ line 3, column 3, field `qty`: `x2` is not a whole number that fits in i64; writ
 line 5: this record has 4 fields, but the header has 3; give every record 3 fields, or read with `Dialect::flexible(true)`
 ```
 
+A `FieldCount` error skips its record, so a loop that catches it and
+reads on gets the next one. Any other read error (a quote left open,
+text after a quote, bad UTF-8, a failed read) ends the stream, since
+there is no record boundary to restart from: the next call gives the
+end.
+
 ## What is in it
 
 | Item | Contents |
