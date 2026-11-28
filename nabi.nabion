@@ -1,6 +1,6 @@
 Package {
     name: "csv",
-    version: "0.1.0",
+    version: "0.1.1",
     nabi_version: "0.1.0",
     toolchain: "0.1",
     description: "Fast streaming CSV (RFC 4180 and common dialects): SIMD record scanning, borrowed fields, typed rows with #[derive(Csv)], a correct writer",

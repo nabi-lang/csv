@@ -2,7 +2,15 @@
 
 All notable changes to this package. Versions follow semver, independent of the Nabi toolchain.
 
-## 0.1.0 (unreleased)
+## 0.1.1 (2026-11-29)
+
+- A read error other than a wrong field count (a quote left open, text
+  after a quote, bad UTF-8, a failed read) ends the stream: the next
+  call gives the end instead of the same error again, so a loop that
+  catches errors and reads on stops. A `FieldCount` error still skips
+  its record.
+
+## 0.1.0 (2026-11-22)
 
 First release.
 
