@@ -40,6 +40,8 @@ const BAD: usize = 11;
 /// Reading a `str` (`text[1]`), and how much of it is in the buffer.
 const SRC: usize = 12;
 const SRC_OFF: usize = 13;
+/// Set after an error the reader cannot resync from: the stream is over.
+const OVER: usize = 14;
 
 /// Records scanned ahead at most, and index slots per batch at most.
 const BATCH: usize = 256;
@@ -61,6 +63,11 @@ const NO_WIDTH: usize = usize::MAX;
 /// stays small;
 /// `decode` turns rows into structs. Copies of a reader share its
 /// place in the input.
+///
+/// A `FieldCount` error skips its record, so reading can go on. Any
+/// other read error (a quote left open, text after a quote, bad UTF-8,
+/// a failed read) ends the stream: there is no record boundary to
+/// restart from, so the next call gives the end.
 ///
 /// ```nabi
 /// let r = csv::from_str("city,pop\nOslo,709000\nBergen,291000\n");
@@ -117,7 +124,7 @@ impl Reader {
             buf: [List::new()],
             text: [""],
             idx: [List::new()],
-            at: [0, 1, 0, 0, 0, 0, 0, NO_WIDTH, NO_WIDTH, 0, 0, 0, 0, 0],
+            at: [0, 1, 0, 0, 0, 0, 0, NO_WIDTH, NO_WIDTH, 0, 0, 0, 0, 0, 0],
             delim: d.delim, quote: byte(d.quote), escape: byte(d.escape), comment: byte(d.comment), bits,
             w: [1u8, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, 128],
         }
@@ -155,7 +162,7 @@ impl Reader {
     /// assert((try! r.headers()).names() == ["a", "b"]);
     /// ```
     pub fn headers(self) throws (CsvError) -> Headers {
-        if self.at[STARTED] == 0 { try self.start(); }
+        if self.at[STARTED] == 0 { try self.start() catch e { throw self.over(e); }; }
         self.st[0].hdr ?? Headers::new([])
     }
 
@@ -170,8 +177,9 @@ impl Reader {
     /// assert(sum == 6);
     /// ```
     pub fn read(self, ref rec: Record) throws (CsvError) -> bool {
-        if self.at[STARTED] == 0 { try self.start(); }
-        try self.raw(ref rec)
+        if self.at[OVER] != 0 { return false; }
+        if self.at[STARTED] == 0 { try self.start() catch e { throw self.over(e); }; }
+        try self.raw(ref rec) catch e { throw self.over(e); }
     }
 
     /// The line the reader is at, 1-based: where the next record starts.
@@ -214,7 +222,12 @@ impl Reader {
     /// assert(cols[0] == ["1", "2"] && cols[1] == ["x", "y"] && quoted[1] == [0usize]);
     /// ```
     pub fn read_columns(self, cols: List<List<str>>, quoted: List<List<usize>>, max: usize) throws (CsvError) -> usize {
-        if self.at[STARTED] == 0 { try self.start(); }
+        if self.at[OVER] != 0 { return 0; }
+        if self.at[STARTED] == 0 { try self.start() catch e { throw self.over(e); }; }
+        try self.columns(cols, quoted, max) catch e { throw self.over(e); }
+    }
+
+    fn columns(self, cols: List<List<str>>, quoted: List<List<usize>>, max: usize) throws (CsvError) -> usize {
         let at = self.at;
         let w = cols.len();
         let check = self.bits & FLEXIBLE == 0u32;
@@ -297,6 +310,15 @@ impl Reader {
     /// assert(c.name == "Oslo" && c.pop == 709000);
     /// ```
     pub fn decode<T: FromRecord>(self) -> Rows<T> { Rows::new(self) }
+
+    /// `e`, ending the stream unless it is a `FieldCount` error: that
+    /// record is read and the next one starts on its own line, while
+    /// after a quote left open, text after a quote, bad UTF-8 or a
+    /// failed read there is no record boundary to restart from.
+    fn over(self, e: CsvError) -> CsvError {
+        if e.kind != ErrorKind::FieldCount { self.at[OVER] = 1; }
+        e
+    }
 
     /// The first records: the byte order mark and the header.
     fn start(self) throws (CsvError) {
